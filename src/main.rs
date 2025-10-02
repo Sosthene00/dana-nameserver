@@ -10,6 +10,7 @@ use axum::{
 };
 use reqwest::Client;
 use log::{info, warn, error, debug};
+use silentpayments::Network;
 use std::{net::SocketAddr, str::FromStr, sync::Arc};
 
 #[derive(Deserialize, Serialize)]
@@ -48,8 +49,8 @@ async fn check_txt_record_exists(
     let name = hickory_client::proto::rr::Name::from_str(record_name)?;
     
     let response: DnsResponse = client
-    .query(name, DNSClass::IN, RecordType::TXT)
-    .await?;
+        .query(name, DNSClass::IN, RecordType::TXT)
+        .await?;
 
     let answers: &[Record] = response.answers();
 
@@ -262,9 +263,15 @@ async fn handle_register(
         }
     };
 
+    // We modify the key depending on the network we're on (mainnet vs signet/testnet)
+    let network_key = match sp_address.get_network() {
+        Network::Mainnet => "sp",
+        _ => "tsp"
+    };
+
     // Format: {user}.user._bitcoin-payment.{domain}
     let txt_name = format!("{}.user._bitcoin-payment.{}", validated_user, validated_domain);
-    let txt_content = format!("bitcoin:?sp={}", sp_address.to_string());
+    let txt_content = format!("bitcoin:?{}={}", network_key, sp_address.to_string());
     
     let record_name = Some(txt_name.clone());
 
