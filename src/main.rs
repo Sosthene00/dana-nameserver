@@ -1,5 +1,4 @@
-use hickory_client::{client::ClientHandle, proto::{rr::{DNSClass, RecordType, Record}, runtime::TokioRuntimeProvider, udp::UdpClientStream}};
-use hickory_client::proto::xfer::DnsResponse;
+use bip353::{Bip353Error, ResolverConfig};
 use serde::{Deserialize, Serialize};
 use axum::{
     extract::State,
@@ -10,13 +9,15 @@ use axum::{
 };
 use reqwest::Client;
 use log::{info, warn, error, debug};
-use silentpayments::Network;
-use std::{net::SocketAddr, str::FromStr, sync::Arc};
+use silentpayments::Network as SpNetwork;
+use std::sync::Arc;
+use bitcoin_payment_instructions::{amount::Amount, dns_resolver::DNSHrnResolver, PaymentInstructions, PaymentMethod, Network};
+use rand::Rng;
+use faker_rand::en_us::{company::Slogan, names::LastName};
 
 #[derive(Deserialize, Serialize)]
 struct Request {
     user_name: String,
-    domain: String,
     sp_address: String,
 }
 
@@ -38,28 +39,59 @@ struct CloudflareRequest {
 }
 
 async fn check_txt_record_exists(
-    record_name: &str,
-) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
-    debug!("Checking if TXT record exists: {}", record_name);
-    let address = SocketAddr::from(([8, 8, 8, 8], 53));
-    let conn = UdpClientStream::builder(address, TokioRuntimeProvider::default()).build();
-    let (mut client, bg) = hickory_client::client::Client::connect(conn).await?;
-    tokio::spawn(bg);
-
-    let name = hickory_client::proto::rr::Name::from_str(record_name)?;
-    
-    let response: DnsResponse = client
-        .query(name, DNSClass::IN, RecordType::TXT)
-        .await?;
-
-    let answers: &[Record] = response.answers();
-
-    let txt_data = answers
-        .iter()
-        .flat_map(|record| record.data().as_txt())
-        .collect::<Vec<_>>();
-
-    Ok(!txt_data.is_empty())
+    user_name: &str,
+    domain: &str,
+    network: SpNetwork
+) -> Result<bool, Bip353Error> {
+    debug!("Checking if TXT record exists for user {} on network {:?}", user_name, network);
+    // Let's not allow regtest address is doesn't make much sense anyway
+    let core_network = match network {
+        SpNetwork::Mainnet => Network::Bitcoin,
+        SpNetwork::Testnet => Network::Testnet,
+        SpNetwork::Regtest => return Err(Bip353Error::InvalidAddress("Don't allow for regtest address".to_string()))
+    };
+    // Basically silent payments doesn't make the distinction between different testnet
+    let dns_config = match core_network {
+        Network::Bitcoin => ResolverConfig::default(),
+        Network::Testnet => ResolverConfig::testnet(),
+        _ => unreachable!()
+    };
+    let socket_addr = dns_config.dns_resolver.clone();
+    let resolver = bip353::Bip353Resolver::with_config(dns_config)?;
+    let resolved_address = resolver.resolve(user_name, domain).await;
+    let payment_instructions = match resolved_address {
+        Ok(instructions) => instructions,
+        Err(e) => {
+            match e {
+                Bip353Error::WrongNetwork(_) => return Ok(false), // We have a sp address but for the wrong network
+                Bip353Error::DnsError(_) => return Ok(false), // We can't find a record for this user name
+                _ => return Err(e)
+            }
+        }
+    };
+    let sp_record_exists = match payment_instructions {
+        PaymentInstructions::ConfigurableAmount(instructions) => {
+            // The resolver is pretty much useless here since we're only interested in silent payment
+            let hrn_resolver = DNSHrnResolver(socket_addr); 
+            let dummy_amount = Amount::from_sats(10_000).unwrap(); // Just defining something unlikely to fail in case there's a lnurl in the same entry
+            let fixed_amt_instructions = instructions.set_amount(dummy_amount, &hrn_resolver).await?;
+            fixed_amt_instructions.methods().iter().any(|method| {
+                match method {
+                    PaymentMethod::SilentPayment(_) => true,
+                    _ => false
+                }
+            })
+        }
+        PaymentInstructions::FixedAmount(instructions) => {
+            instructions.methods().iter().any(|method| {
+                match method {
+                    PaymentMethod::SilentPayment(_) => true,
+                    _ => false
+                }
+            })
+        }
+    };
+    Ok(sp_record_exists)
 }
 
 async fn create_txt_record(
@@ -105,94 +137,34 @@ async fn create_txt_record(
     }
 }
 
-
-fn validate_username(input: &str) -> Result<String, String> {
-    if !input.is_ascii() {
-        return Err(format!("'{}' contains non-ASCII characters. Only ASCII characters are supported.", input));
-    }
-    
-    let lowercase = input.to_lowercase();
-    
-    if lowercase.is_empty() {
-        return Err("Username cannot be empty".to_string());
-    }
-    
-    if lowercase.starts_with('-') || lowercase.ends_with('-') {
-        return Err("Username cannot start or end with hyphen".to_string());
-    }
-    
-    if !lowercase.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
-        return Err("Username can only contain letters, numbers, and hyphens".to_string());
-    }
-    
-    if lowercase.contains("--") {
-        return Err("Username cannot contain consecutive hyphens".to_string());
-    }
-    
-    Ok(lowercase)
-}
-
-fn validate_domain(input: &str) -> Result<String, String> {
-    if !input.is_ascii() {
-        return Err(format!("'{}' contains non-ASCII characters. Only ASCII characters are supported.", input));
-    }
-    
-    let lowercase = input.to_lowercase();
-    
-    if lowercase.is_empty() {
-        return Err("Domain cannot be empty".to_string());
-    }
-    
-    // Check for valid domain structure: at least one dot and valid TLD
-    if !lowercase.contains('.') {
-        return Err("Domain must include extension (e.g., .com, .org, .io)".to_string());
-    }
-    
-    let parts: Vec<&str> = lowercase.split('.').collect();
-    if parts.len() < 2 {
-        return Err("Domain must have at least a name and extension".to_string());
-    }
-    
-    // Validate each part of the domain
-    for (i, part) in parts.iter().enumerate() {
-        if part.is_empty() {
-            return Err("Domain parts cannot be empty".to_string());
-        }
-        
-        if part.starts_with('-') || part.ends_with('-') {
-            return Err("Domain parts cannot start or end with hyphen".to_string());
-        }
-        
-        if !part.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
-            return Err("Domain parts can only contain letters, numbers, and hyphens".to_string());
-        }
-        
-        if part.contains("--") {
-            return Err("Domain parts cannot contain consecutive hyphens".to_string());
-        }
-        
-        // TLD (last part) should be at least 2 characters
-        if i == parts.len() - 1 && part.len() < 2 {
-            return Err("Domain extension must be at least 2 characters".to_string());
-        }
-    }
-    
-    Ok(lowercase)
-}
-
 #[derive(Clone)]
 struct AppState {
     zone_id: String,
     api_token: String,
+    domain: String,
+}
+
+fn generate_random_username() -> String {
+    let mut rng = rand::thread_rng();
+    let adjective;
+    loop {
+        let slogan = rng.r#gen::<Slogan>().to_string();
+        if slogan.split_ascii_whitespace().next().unwrap().contains("-") {
+            continue;
+        }
+        adjective = slogan.split_ascii_whitespace().next().unwrap().to_string();
+        break;
+    }
+    let last_name= rng.r#gen::<LastName>().to_string();
+    let number = rng.r#gen::<u8>().to_string();
+    let username = format!("{}{}{}", adjective, last_name, number);
+    username
 }
 
 async fn handle_register(
     State(state): State<Arc<AppState>>,
     Json(request): Json<Request>,
 ) -> (StatusCode, AxumJson<ResponseBody>) {
-    info!("Received registration request for user: {} on domain: {}", request.user_name, request.domain);
-    debug!("User {} provided sp address: {}", request.user_name, request.sp_address);
-    
     let dns_record_id;
     
     // Just in case
@@ -210,37 +182,14 @@ async fn handle_register(
         );
     }
 
-    // Validate user name and domain
-    let validated_user = match validate_username(&request.user_name) {
-        Ok(user) => user,
-        Err(e) => {
-            error!("Invalid user name '{}': {}", request.user_name, e);
-            return (
-                StatusCode::BAD_REQUEST,
-                AxumJson(ResponseBody {
-                    message: format!("Invalid user name: {}", e),
-                    received: request,
-                    dns_record_id: None,
-                    record_name: None,
-                })
-            );
-        }
-    };
-    
-    let validated_domain = match validate_domain(&request.domain) {
-        Ok(domain) => domain,
-        Err(e) => {
-            error!("Invalid domain '{}': {}", request.domain, e);
-            return (
-                StatusCode::BAD_REQUEST,
-                AxumJson(ResponseBody {
-                    message: format!("Invalid domain: {}", e),
-                    received: request,
-                    dns_record_id: None,
-                    record_name: None,
-                })
-            );
-        }
+    // if user_name is empty, we generate a random one
+    let user_name = if request.user_name.is_empty() {
+        let random_user_name = generate_random_username();
+        info!("Generated random user name: {}", random_user_name);
+        random_user_name
+    } else {
+        info!("User {} provided user name", request.user_name);
+        request.user_name.clone()
     };
 
     // Validate SP address
@@ -265,47 +214,44 @@ async fn handle_register(
 
     // We modify the key depending on the network we're on (mainnet vs signet/testnet)
     let network_key = match sp_address.get_network() {
-        Network::Mainnet => "sp",
-        _ => "tsp"
+        SpNetwork::Mainnet => "sp",
+        SpNetwork::Testnet => "tsp",
+        SpNetwork::Regtest => "sprt"
     };
 
-    // Format: {user}.user._bitcoin-payment.{domain}
-    let txt_name = format!("{}.user._bitcoin-payment.{}", validated_user, validated_domain);
-    let txt_content = format!("bitcoin:?{}={}", network_key, sp_address.to_string());
-    
-    let record_name = Some(txt_name.clone());
-
     // First check if the record already exists using DNS-over-HTTPS
-    match check_txt_record_exists(&txt_name).await {
+    // It's very unlikely but let's be safe
+    match check_txt_record_exists(&user_name, &state.domain, sp_address.get_network()).await {
         Ok(true) => {
-            error!("TXT record already exists: {}", txt_name);
+            error!("TXT record already exists for user name: {}", user_name);
             return (
                 StatusCode::CONFLICT,
                 AxumJson(ResponseBody {
                     message: "TXT record already exists".to_string(),
                     received: request,
                     dns_record_id: None, // We don't have the Cloudflare record ID from DNS check
-                    record_name: Some(txt_name),
+                    record_name: None,
                 })
             );
         }
-        Ok(false) => {
-            info!("No existing TXT record found for {}", txt_name);
-        }
+        Ok(false) => debug!("Didn't find a sp address for network {:?} and user name {}", sp_address.get_network(), user_name),
         Err(e) => {
-            error!("Error checking for existing TXT record {}: {}", txt_name, e);
+            error!("Error checking for existing TXT record for user name {}: {}", user_name, e);
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 AxumJson(ResponseBody {
                     message: format!("Error checking for existing TXT record: {}", e),
                     received: request,
                     dns_record_id: None,
-                    record_name: Some(txt_name),
+                    record_name: None,
                 })
             );
         }
     };
     
+    let txt_name = format!("{}.user._bitcoin-payment.{}", user_name, state.domain);
+    let txt_content = format!("bitcoin:?{}={}", network_key, sp_address.to_string());
+
     info!("Attempting to create TXT record: {}", txt_name);
     let client = Client::new();
     
@@ -344,7 +290,7 @@ async fn handle_register(
         message: "Payment instructions processed successfully".to_string(),
         received: request,
         dns_record_id,
-        record_name,
+        record_name: Some(txt_name),
     };
     
     debug!("Sending response for record: {}", response_body.record_name.as_ref().unwrap_or(&"unknown".to_string()));
@@ -367,8 +313,9 @@ async fn main() {
         info!("Successfully loaded .env file");
     }
 
-    let zone_id = std::env::var("CLOUDFLARE_ZONE_ID").unwrap_or_default();
-    let api_token = std::env::var("CLOUDFLARE_API_TOKEN").unwrap_or_default();
+    let zone_id = std::env::var("CLOUDFLARE_ZONE_ID").expect("CLOUDFLARE_ZONE_ID environment variable is required");
+    let api_token = std::env::var("CLOUDFLARE_API_TOKEN").expect("CLOUDFLARE_API_TOKEN environment variable is required");
+    let domain = std::env::var("DOMAIN_NAME").expect("DOMAIN_NAME environment variable is required");
     
     if zone_id.is_empty() || api_token.is_empty() {
         error!("Cloudflare credentials not provided. Can't proceed.");
@@ -383,6 +330,7 @@ async fn main() {
     let state = Arc::new(AppState {
         zone_id,
         api_token,
+        domain,
     });
 
     let app = Router::new()
@@ -404,187 +352,22 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use silentpayments::SilentPaymentAddress;
+
+    #[test]
+    fn test_generate_random_username() {
+        let username = generate_random_username();
+        println!("Generated username: {}", username);
+        assert!(!username.is_empty());
+    }
 
     #[tokio::test]
     async fn test_check_txt_record_exists_with_existing_record() {
-        // Test with a well-known domain that should have TXT records
-        // Using Google's domain which typically has SPF/DKIM records
-        let result = check_txt_record_exists("google.com").await;
-        
-        // This test might be flaky due to network conditions, but it should generally work
-        match result {
-            Ok(exists) => {
-                // We expect this to be true for google.com as it has TXT records
-                assert!(exists, "Google.com should have TXT records");
-            }
-            Err(e) => {
-                // If network fails, we should still test the error handling
-                println!("Network error during test (expected in some environments): {}", e);
-            }
-        }
-    }
+        let address_to_register = SilentPaymentAddress::try_from("sp1qq0cygnetgn3rz2kla5cp05nj5uetlsrzez0l4p8g7wehf7ldr93lcqadw65upymwzvp5ed38l8ur2rznd6934xh95msevwrdwtrpk372hyz4vr6g").unwrap();
+        let result = check_txt_record_exists("donate", "danawallet.app", address_to_register.get_network()).await;
 
-    #[tokio::test]
-    async fn test_check_txt_record_exists_with_nonexistent_record() {
-        // Test with a domain that likely doesn't exist
-        let result = check_txt_record_exists("this-domain-definitely-does-not-exist-12345.invalid").await;
-        
-        match result {
-            Ok(exists) => {
-                assert!(!exists, "Non-existent domain should not have TXT records");
-            }
-            Err(e) => {
-                // DNS resolution failure is also acceptable for non-existent domains
-                println!("DNS resolution failed for non-existent domain (expected): {}", e);
-            }
-        }
-    }
+        println!("{:?}", result);
 
-    #[tokio::test]
-    async fn test_check_txt_record_exists_with_invalid_domain() {
-        // Test with malformed domain name
-        let result = check_txt_record_exists("invalid..domain").await;
-        
-        // This should return an error due to invalid domain format
-        assert!(result.is_err(), "Invalid domain format should return an error");
-        
-        if let Err(e) = result {
-            // The error should be related to domain parsing
-            let error_msg = e.to_string().to_lowercase();
-            assert!(
-                error_msg.contains("invalid") || 
-                error_msg.contains("parse") || 
-                error_msg.contains("name") ||
-                error_msg.contains("malformed") ||
-                error_msg.contains("label"),
-                "Error message should indicate domain parsing issue: {}",
-                e
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn test_check_txt_record_exists_with_empty_domain() {
-        // Test with empty domain
-        let result = check_txt_record_exists("").await;
-        
-        // Empty domain should return an error or false (depending on DNS library behavior)
-        match result {
-            Ok(exists) => {
-                // If it doesn't error, it should return false for empty domain
-                assert!(!exists, "Empty domain should not have TXT records");
-            }
-            Err(e) => {
-                // This is also acceptable - empty domain should cause an error
-                let error_msg = e.to_string().to_lowercase();
-                assert!(
-                    error_msg.contains("invalid") || 
-                    error_msg.contains("parse") || 
-                    error_msg.contains("name") ||
-                    error_msg.contains("malformed") ||
-                    error_msg.contains("label") ||
-                    error_msg.contains("empty"),
-                    "Error message should indicate domain parsing issue: {}",
-                    e
-                );
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn test_check_txt_record_exists_with_specific_txt_record() {
-        // Test with a specific subdomain that might have TXT records
-        // Using a common pattern for verification records
-        let result = check_txt_record_exists("_verification.github.com").await;
-        
-        match result {
-            Ok(exists) => {
-                // GitHub might have verification records, but we can't be certain
-                // This test mainly ensures the function doesn't panic
-                println!("GitHub verification record exists: {}", exists);
-            }
-            Err(e) => {
-                // Network or DNS errors are acceptable in test environments
-                println!("DNS query failed (expected in some environments): {}", e);
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn test_check_txt_record_exists_error_handling() {
-        // Test that the function properly handles DNS resolution errors
-        // Using a domain that should cause a specific type of error
-        let result = check_txt_record_exists("test.invalid").await;
-        
-        // The .invalid TLD should cause a DNS resolution error
-        match result {
-            Ok(_) => {
-                // If it somehow resolves, that's unexpected but not a test failure
-                println!("Unexpectedly resolved .invalid domain");
-            }
-            Err(e) => {
-                // This is the expected behavior
-                let error_msg = e.to_string().to_lowercase();
-                assert!(
-                    error_msg.contains("nxdomain") || 
-                    error_msg.contains("not found") ||
-                    error_msg.contains("no such name") ||
-                    error_msg.contains("resolution") ||
-                    error_msg.contains("timeout"),
-                    "Error should indicate DNS resolution failure: {}",
-                    e
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn test_validate_username_valid_cases() {
-        // Test valid usernames
-        assert_eq!(validate_username("alice"), Ok("alice".to_string()));
-        assert_eq!(validate_username("bob123"), Ok("bob123".to_string()));
-        assert_eq!(validate_username("user-name"), Ok("user-name".to_string()));
-        assert_eq!(validate_username("ALICE"), Ok("alice".to_string())); // Should be lowercased
-        assert_eq!(validate_username("User123"), Ok("user123".to_string()));
-    }
-
-    #[test]
-    fn test_validate_username_invalid_cases() {
-        // Test invalid usernames
-        assert!(validate_username("").is_err());
-        assert!(validate_username("-alice").is_err());
-        assert!(validate_username("alice-").is_err());
-        assert!(validate_username("alice--bob").is_err());
-        assert!(validate_username("alice bob").is_err());
-        assert!(validate_username("alice@bob").is_err());
-        assert!(validate_username("alice.bob").is_err());
-        assert!(validate_username("alice_bob").is_err());
-        assert!(validate_username("aliceé").is_err()); // Non-ASCII
-    }
-
-    #[test]
-    fn test_validate_domain_valid_cases() {
-        // Test valid domains
-        assert_eq!(validate_domain("example.com"), Ok("example.com".to_string()));
-        assert_eq!(validate_domain("sub.example.com"), Ok("sub.example.com".to_string()));
-        assert_eq!(validate_domain("example.org"), Ok("example.org".to_string()));
-        assert_eq!(validate_domain("EXAMPLE.COM"), Ok("example.com".to_string())); // Should be lowercased
-        assert_eq!(validate_domain("test-domain.co.uk"), Ok("test-domain.co.uk".to_string()));
-    }
-
-    #[test]
-    fn test_validate_domain_invalid_cases() {
-        // Test invalid domains
-        assert!(validate_domain("").is_err());
-        assert!(validate_domain("example").is_err()); // No TLD
-        assert!(validate_domain(".com").is_err()); // Empty domain part
-        assert!(validate_domain("example.").is_err()); // Empty TLD
-        assert!(validate_domain("-example.com").is_err()); // Starts with hyphen
-        assert!(validate_domain("example-.com").is_err()); // Ends with hyphen
-        assert!(validate_domain("example..com").is_err()); // Double dot
-        assert!(validate_domain("example.c").is_err()); // TLD too short
-        assert!(validate_domain("example com").is_err()); // Space
-        assert!(validate_domain("example@com").is_err()); // Invalid character
-        assert!(validate_domain("examplé.com").is_err()); // Non-ASCII
+        assert!(false); 
     }
 }
