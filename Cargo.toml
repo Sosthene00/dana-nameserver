@@ -15,5 +15,5 @@ env_logger = "0.10"
 silentpayments = "0.4.1"
 faker_rand = "0.1.1"
 rand = "0.8.5"
-bip353-rs = { path="../bip353-rs" }
-bitcoin-payment-instructions = { path="../bitcoin-payment-instructions" }
+bip353-rs = { git="https://github.com/Sosthene00/bip353-rs.git", branch="silentpayments" }
+bitcoin-payment-instructions = { git="https://github.com/Sosthene00/bitcoin-payment-instructions.git", branch="add_silent_payments" }

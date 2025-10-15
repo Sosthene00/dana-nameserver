@@ -149,6 +149,7 @@ checksum = "230c5f1ca6a325a32553f8640d31ac9b49f2411e901e427570154868b46da4f7"
 [[package]]
 name = "bip353-rs"
 version = "0.1.1"
+source = "git+https://github.com/Sosthene00/bip353-rs.git?branch=silentpayments#2ce1f505492887a09ca8facc2e24085c47e67227"
 dependencies = [
  "async-trait",
  "bitcoin",
@@ -199,6 +200,7 @@ checksum = "0b47c4ab7a93edb0c7198c5535ed9b52b63095f4e9b45279c6736cec4b856baf"
 [[package]]
 name = "bitcoin-payment-instructions"
 version = "0.4.0"
+source = "git+https://github.com/Sosthene00/bitcoin-payment-instructions.git?branch=add_silent_payments#9ba923a0a4adbc50fb2eea10fc69e5f60e66d40b"
 dependencies = [
  "bitcoin",
  "dnssec-prover",
