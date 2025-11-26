@@ -162,10 +162,11 @@ async fn handle_register(
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             AxumJson(ResponseBody {
-                message: ERROR_MESSAGE.to_string(),
-                received: request,
+                id: request.id,
+                message: "Internal server error, please try again later".to_string(),
+                dana_address: None,
+                sp_address: None,
                 dns_record_id: None,
-                record_name: None,
             })
         );
     }
@@ -182,9 +183,10 @@ async fn handle_register(
                 StatusCode::BAD_REQUEST,
                 AxumJson(ResponseBody {
                     message: format!("Invalid SP address: {}", e),
-                    received: request,
+                    id: request.id,
+                    dana_address: None,
+                    sp_address: None,
                     dns_record_id: None,
-                    record_name: None,
                 })
             );
         }
@@ -199,28 +201,35 @@ async fn handle_register(
                 StatusCode::BAD_REQUEST,
                 AxumJson(ResponseBody {
                     message: format!("Can't register regtest addresses"),
-                    received: request,
+                    id: request.id,
+                    dana_address: None,
+                    sp_address: None,
                     dns_record_id: None,
-                    record_name: None,
                 })
             );
         }
     };
 
     // TODO verify a signature over some message that user must provides with the request
-    // This is mitigated by the deterministic nature of the username generation, meaning that an impersonator will simply generate an address for someone else without being able to do anything with it
 
     // if user_name is empty, we generate a random one
-    let user_name = if request.user_name.is_empty() {
-        let random_user_name = generate_random_username(&sp_address);
-        info!("Generated random user name: {}", random_user_name);
-        random_user_name
-    } else {
-        // this won't happen now but we can always support it in the future
-        info!("User {} provided user name", request.user_name);
-        request.user_name.clone()
+    let user_name = match request.user_name {
+        Some(user_name) => user_name,
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                AxumJson(ResponseBody {
+                    message: format!("User name is required"),
+                    id: request.id,
+                    dana_address: None,
+                    sp_address: None,
+                    dns_record_id: None,
+                })
+            );
+        }
     };
 
+    let dana_address = format!("{}@{}", user_name, state.domain);
     let txt_name = format!("{}.user._bitcoin-payment.{}", user_name, state.domain);
     let txt_content = format!("bitcoin:?{}={}", network_key, sp_address.to_string());
 
@@ -232,22 +241,24 @@ async fn handle_register(
                 StatusCode::CONFLICT,
                 AxumJson(ResponseBody {
                     message: "TXT record already exists".to_string(),
-                    received: request,
+                    id: request.id,
+                    dana_address: Some(format!("{}@{}", user_name, state.domain)),
+                    sp_address: Some(sp_address.to_string()),
                     dns_record_id: None, // We don't have the Cloudflare record ID from DNS check
-                    record_name: Some(txt_name), // This can be useful if user is restoring an existing wallet, he will get is dana address back this way
                 })
             );
         }
-        Ok(false) => debug!("Didn't find a sp address for network {:?} and user name {}", sp_address.get_network(), user_name),
+        Ok(None) => debug!("Didn't find a sp address for network {:?} and user name {}", sp_address.get_network(), user_name),
         Err(e) => {
             error!("Error checking for existing TXT record for user name {}: {}", user_name, e);
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 AxumJson(ResponseBody {
                     message: format!("Error checking for existing TXT record: {}", e),
-                    received: request,
+                    id: request.id,
+                    dana_address: None,
+                    sp_address: None,
                     dns_record_id: None,
-                    record_name: None,
                 })
             );
         }
@@ -267,9 +278,10 @@ async fn handle_register(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 AxumJson(ResponseBody {
                     message: "Failed to create DNS record: No ID returned from Cloudflare".to_string(),
-                    received: request,
+                    id: request.id,
+                    dana_address: None,
+                    sp_address: None,
                     dns_record_id: None,
-                    record_name: Some(txt_name),
                 })
             );
         }
@@ -279,22 +291,24 @@ async fn handle_register(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 AxumJson(ResponseBody {
                     message: format!("Failed to create DNS record: {}", e),
-                    received: request,
+                    id: request.id,
+                    dana_address: None,
+                    sp_address: None,
                     dns_record_id: None,
-                    record_name: Some(txt_name),
                 })
             );
         }
     };
 
     let response_body = ResponseBody {
-        message: "Payment instructions processed successfully".to_string(),
-        received: request,
+        id: request.id,
+        message: "Successfully registered silent payment address".to_string(),
+        dana_address: Some(dana_address),
+        sp_address: Some(sp_address.to_string()),
         dns_record_id,
-        record_name: Some(txt_name),
     };
     
-    debug!("Sending response for record: {}", response_body.record_name.as_ref().unwrap_or(&"unknown".to_string()));
+    debug!("Sending response for record: {}", response_body.dana_address.as_ref().unwrap_or(&"unknown".to_string()));
     (
         StatusCode::OK,
         AxumJson(response_body)
