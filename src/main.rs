@@ -15,16 +15,19 @@ use bitcoin_payment_instructions::{amount::Amount, dns_resolver::DNSHrnResolver,
 
 #[derive(Deserialize, Serialize)]
 struct Request {
-    user_name: String,
+    id: String,
+    domain: String,
+    user_name: Option<String>,
     sp_address: String,
 }
 
 #[derive(Serialize)]
 struct ResponseBody {
+    id: String,
     message: String,
-    received: Request,
+    dana_address: Option<String>,
+    sp_address: Option<String>,
     dns_record_id: Option<String>,
-    record_name: Option<String>,
 }
 
 #[derive(Serialize)]
