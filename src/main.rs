@@ -157,8 +157,7 @@ async fn handle_register(
     
     // Just in case
     if state.zone_id.is_empty() || state.api_token.is_empty() {
-        const ERROR_MESSAGE: &str = "Cloudflare credentials not provided, DNS record creation failed";
-        error!("{}", ERROR_MESSAGE);
+        error!("Cloudflare credentials missing, DNS record creation failed");
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             AxumJson(ResponseBody {
@@ -169,6 +168,20 @@ async fn handle_register(
                 dns_record_id: None,
             })
         );
+    }
+
+    // If the domain asked by client is not the domain we're registering for, we return a bad request
+    if request.domain != state.domain {
+        return (
+            StatusCode::BAD_REQUEST,
+            AxumJson(ResponseBody {
+                message: format!("Server registers for domain: {}", state.domain),
+                id: request.id,
+                dana_address: None,
+                sp_address: None,
+                dns_record_id: None,
+            })
+        )
     }
 
     // Validate SP address
@@ -385,21 +398,30 @@ mod tests {
     use super::*;
     use silentpayments::SilentPaymentAddress;
 
-    #[test]
-    fn test_generate_random_username() {
+    #[tokio::test]
+    async fn test_check_txt_record_exists_with_address() {
         let address_to_register = SilentPaymentAddress::try_from("sp1qq0cygnetgn3rz2kla5cp05nj5uetlsrzez0l4p8g7wehf7ldr93lcqadw65upymwzvp5ed38l8ur2rznd6934xh95msevwrdwtrpk372hyz4vr6g").unwrap();
-        let username = generate_random_username(&address_to_register);
-        println!("Generated username: {}", username);
-        assert!(!username.is_empty());
+        let result = fetch_sp_address_from_txt_record("donate", "danawallet.app", address_to_register.get_network()).await;
+
+        assert!(result.is_ok()); 
+
+        assert_eq!(result.unwrap(), Some(address_to_register));
     }
 
     #[tokio::test]
-    async fn test_check_txt_record_exists_with_existing_record() {
-        let address_to_register = SilentPaymentAddress::try_from("sp1qq0cygnetgn3rz2kla5cp05nj5uetlsrzez0l4p8g7wehf7ldr93lcqadw65upymwzvp5ed38l8ur2rznd6934xh95msevwrdwtrpk372hyz4vr6g").unwrap();
-        let result = check_txt_record_exists("donate", "danawallet.app", address_to_register.get_network()).await;
+    async fn test_check_txt_record_exists_with_no_address() {
+        let result = fetch_sp_address_from_txt_record("matt", "mattcorallo.com", silentpayments::Network::Mainnet).await;
 
-        println!("{:?}", result);
+        assert!(result.is_ok()); 
 
-        assert!(false); 
+        assert_eq!(result.unwrap(), None);
+    }
+    
+    
+    #[tokio::test]
+    async fn test_check_no_txt_record() {
+        let result = fetch_sp_address_from_txt_record("unknown", "danawallet.app", silentpayments::Network::Mainnet).await;
+
+        assert!(result.is_err()); 
     }
 }
