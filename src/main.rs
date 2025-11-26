@@ -234,8 +234,21 @@ async fn handle_register(
     let txt_content = format!("bitcoin:?{}={}", network_key, sp_address.to_string());
 
     // First check if the record already exists using DNS-over-HTTPS
-    match check_txt_record_exists(&user_name, &state.domain, sp_address.get_network()).await {
-        Ok(true) => {
+    match fetch_sp_address_from_txt_record(&user_name, &state.domain, sp_address.get_network()).await {
+        Ok(Some(registered_sp_address)) => {
+            if registered_sp_address == sp_address {
+                // The record already exists and the SP address is the same, we can return the existing record
+                return (
+                    StatusCode::OK,
+                    AxumJson(ResponseBody {
+                        message: "TXT record already exists".to_string(),
+                        id: request.id,
+                        dana_address: Some(dana_address),
+                        sp_address: Some(sp_address.to_string()),
+                        dns_record_id: None,
+                    })
+                );
+            }
             error!("TXT record already exists for user name: {}", user_name);
             return (
                 StatusCode::CONFLICT,
