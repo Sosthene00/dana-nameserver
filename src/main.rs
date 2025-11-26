@@ -149,34 +149,6 @@ struct AppState {
     domain: String,
 }
 
-// Generate a random username deterministically on the SP address
-fn generate_random_username(sp_address: &SilentPaymentAddress) -> String {
-    let network_str = match sp_address.get_network() {
-        SpNetwork::Mainnet => "mainnet",
-        SpNetwork::Testnet => "testnet",
-        _ => unreachable!()
-    };
-    let mut engine = sha256::Hash::engine();
-    engine.input(sp_address.get_scan_key().serialize().as_slice());
-    engine.input(sp_address.get_spend_key().serialize().as_slice());
-    engine.input(network_str.as_bytes());
-    let seed = sha256::Hash::from_engine(engine);
-    let mut rng = rand::rngs::StdRng::from_seed(*seed.as_byte_array());
-    let adjective;
-    loop {
-        let slogan = rng.r#gen::<Slogan>().to_string();
-        if slogan.split_ascii_whitespace().next().unwrap().contains("-") {
-            continue;
-        }
-        adjective = slogan.split_ascii_whitespace().next().unwrap().to_string();
-        break;
-    }
-    let last_name= rng.r#gen::<LastName>().to_string();
-    let number = rng.r#gen::<u8>().to_string();
-    let username = format!("{}{}{}", adjective, last_name, number);
-    username
-}
-
 async fn handle_register(
     State(state): State<Arc<AppState>>,
     Json(request): Json<Request>,
