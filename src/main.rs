@@ -1,4 +1,4 @@
-use bip353::{Bip353Error, ResolverConfig};
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use axum::{
     extract::{Query, State},
@@ -10,7 +10,7 @@ use axum::{
 use reqwest::{Client};
 use log::{info, warn, error, debug};
 use silentpayments::{Network as SpNetwork, SilentPaymentAddress};
-use std::sync::Arc;
+use std::{net::SocketAddr, str::FromStr, sync::Arc};
 use std::collections::HashMap;
 use tokio::sync::RwLock;
 use bitcoin_payment_instructions::{amount::Amount, dns_resolver::DNSHrnResolver, PaymentInstructions, PaymentMethod, Network};
@@ -79,38 +79,33 @@ async fn fetch_sp_address_from_txt_record(
     user_name: &str,
     domain: &str,
     network: SpNetwork
-) -> Result<Option<SilentPaymentAddress>, Bip353Error> {
+) -> Result<Option<SilentPaymentAddress>> {
     debug!("Checking if TXT record exists for user {} on domain {} and network {:?}", user_name, domain, network);
     // Let's not allow regtest address is doesn't make much sense anyway
     let core_network = match network {
         SpNetwork::Mainnet => Network::Bitcoin,
         SpNetwork::Testnet => Network::Testnet,
-        SpNetwork::Regtest => return Err(Bip353Error::InvalidAddress("Don't allow for regtest address".to_string()))
+        SpNetwork::Regtest => return Err(anyhow::anyhow!("Don't allow for regtest address"))
     };
     // Basically silent payments doesn't make the distinction between different testnet
-    let dns_config = match core_network {
-        Network::Bitcoin => ResolverConfig::default(),
-        Network::Testnet => ResolverConfig::testnet(),
+    let dns_resolver = match core_network {
+        Network::Bitcoin => DNSHrnResolver(SocketAddr::from_str("8.8.8.8:53").unwrap()),
+        Network::Testnet => DNSHrnResolver(SocketAddr::from_str("8.8.8.8:53").unwrap()),
         _ => unreachable!()
     };
-    let socket_addr = dns_config.dns_resolver.clone();
-    let resolver = bip353::Bip353Resolver::with_config(dns_config)?;
-    let resolved_address = resolver.resolve(user_name, domain).await;
-    let payment_instructions = match resolved_address {
+    let payment_instructions = match PaymentInstructions::parse(format!("{}@{}", user_name, domain).as_str(), core_network, &dns_resolver, true).await {
         Ok(instructions) => instructions,
-        Err(e) => {
-            match e {
-                Bip353Error::DnsError(_) => return Ok(None), // We can't find a record for this user name
-                _ => return Err(e)
-            }
-        }
+        Err(e) => return Err(anyhow::anyhow!("Error parsing payment instructions: {:?}", e))
     };
     match payment_instructions {
         PaymentInstructions::ConfigurableAmount(instructions) => {
             // The resolver is pretty much useless here since we're only interested in silent payment
-            let hrn_resolver = DNSHrnResolver(socket_addr); 
+            let hrn_resolver = DNSHrnResolver(dns_resolver.0); 
             let dummy_amount = Amount::from_sats(10_000).unwrap(); // Just defining something unlikely to fail in case there's a lnurl in the same entry
-            let fixed_amt_instructions = instructions.set_amount(dummy_amount, &hrn_resolver).await?;
+            let fixed_amt_instructions = match instructions.set_amount(dummy_amount, &hrn_resolver).await {
+                Ok(instructions) => instructions,
+                Err(e) => return Err(anyhow::anyhow!("Error setting amount: {:?}", e))
+            };
             for method in fixed_amt_instructions.methods().iter() {
                 match method {
                     PaymentMethod::SilentPayment(sp_address) => {
