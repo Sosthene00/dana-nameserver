@@ -93,9 +93,15 @@ async fn fetch_sp_address_from_txt_record(
     let payment_instructions = match PaymentInstructions::parse(format!("{}@{}", user_name, domain).as_str(), core_network, &dns_resolver, true).await {
         Ok(instructions) => instructions,
         Err(e) => {
-            match e {
-                bitcoin_payment_instructions::ParseError::HrnResolutionError(_) => return Ok(None), // We can't find a record for this user name
-                _ => return Err(anyhow::anyhow!("Error parsing payment instructions: {:?}", e))
+            if format!("{:?}", e).contains("Multiple TXT records") {
+                warn!("Multiple TXT records found for {}@{}. This should have been cleaned up before DNS query.", user_name, domain);
+                return Err(anyhow::anyhow!("Multiple TXT records exist for {}@{}, which is invalid. Please clean up duplicate records.", user_name, domain));
+            } else {
+                error!("Error parsing payment instructions: {:?}", e);
+                match e {
+                    bitcoin_payment_instructions::ParseError::HrnResolutionError(_) => return Ok(None), // We can't find a record for this user name
+                    _ => return Err(anyhow::anyhow!("Error parsing payment instructions: {:?}", e))
+                }
             }
         }
     };
