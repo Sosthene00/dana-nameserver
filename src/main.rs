@@ -31,6 +31,7 @@ struct AppState {
     zone_id: String,
     api_token: String,
     domain: String,
+    mainnet_only: bool,
     sp_to_dana: Arc<RwLock<HashMap<SilentPaymentAddress, Vec<String>>>>,
     dana_to_sp: Arc<RwLock<HashMap<String, SilentPaymentAddress>>>,
 }
@@ -256,6 +257,20 @@ async fn handle_register(
                 );
             }
         };
+
+    // of only allowing mainnet, reject testnet addresses
+    if state.mainnet_only && sp_address.get_network() != SpNetwork::Mainnet {
+        return (
+            StatusCode::BAD_REQUEST,
+            AxumJson(RegisterResponse {
+                id: request.id,
+                message: "Testnet not allowed".to_string(),
+                dana_address: None,
+                sp_address: None,
+                dns_record_id: None,
+            }),
+        );
+    }
 
     // We modify the key depending on the network we're on (mainnet vs signet/testnet)
     let network_key = match sp_address.get_network() {
@@ -629,6 +644,18 @@ async fn main() {
         .expect("CLOUDFLARE_API_TOKEN environment variable is required");
     let domain =
         std::env::var("DOMAIN_NAME").expect("DOMAIN_NAME environment variable is required");
+    let mainnet_only: bool = std::env::var("MAINNET_ONLY")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .expect("MAINNET_ONLY environment variable is required");
+
+    // we only have two network types: main and test
+    // we don't allow regtest, since this doesn't make sense for a public server
+    if mainnet_only {
+        info!("Allowing mainnet only");
+    } else {
+        info!("Allowing mainnet and testnet");
+    }
 
     if zone_id.is_empty() || api_token.is_empty() {
         error!("Cloudflare credentials not provided. Can't proceed.");
@@ -670,8 +697,11 @@ async fn main() {
                     Err(_) => record.content,
                 };
 
-                debug!("Processing record: name='{}', content='{}'", record.name, content);
-                
+                debug!(
+                    "Processing record: name='{}', content='{}'",
+                    record.name, content
+                );
+
                 // Parse record name: {user_name}.user._bitcoin-payment.{domain}
                 // Extract user_name from the name (user_name can contain dots)
                 let pattern = ".user._bitcoin-payment.";
@@ -792,6 +822,7 @@ async fn main() {
         zone_id,
         api_token,
         domain,
+        mainnet_only,
         sp_to_dana,
         dana_to_sp,
     });
