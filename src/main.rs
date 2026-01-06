@@ -1,19 +1,21 @@
 use anyhow::Result;
-use serde::{Deserialize, Serialize};
 use axum::{
+    Json, Router,
     extract::{Query, State},
     http::StatusCode,
     response::Json as AxumJson,
     routing::{get, post},
-    Json, Router,
 };
-use reqwest::{Client};
-use log::{info, warn, error, debug};
+use bitcoin_payment_instructions::{
+    Network, PaymentInstructions, PaymentMethod, amount::Amount, dns_resolver::DNSHrnResolver,
+};
+use log::{debug, error, info, warn};
+use reqwest::Client;
+use serde::{Deserialize, Serialize};
 use silentpayments::{Network as SpNetwork, SilentPaymentAddress};
-use std::{net::SocketAddr, str::FromStr, sync::Arc};
 use std::collections::HashMap;
+use std::{net::SocketAddr, str::FromStr, sync::Arc};
 use tokio::sync::RwLock;
-use bitcoin_payment_instructions::{amount::Amount, dns_resolver::DNSHrnResolver, PaymentInstructions, PaymentMethod, Network};
 
 const CLOUDFLARE_API_BASE_URL: &str = "https://api.cloudflare.com/client/v4";
 const CLOUDFLARE_DNS_RESOLVER_IP: &str = "1.1.1.1:53";
@@ -79,28 +81,52 @@ struct CloudflareRequest {
 async fn fetch_sp_address_from_txt_record(
     user_name: &str,
     domain: &str,
-    network: SpNetwork
+    network: SpNetwork,
 ) -> Result<Option<SilentPaymentAddress>> {
-    debug!("Checking if TXT record exists for user {} on domain {} and network {:?}", user_name, domain, network);
+    debug!(
+        "Checking if TXT record exists for user {} on domain {} and network {:?}",
+        user_name, domain, network
+    );
     // Let's not allow regtest address is doesn't make much sense anyway
     let core_network = match network {
         SpNetwork::Mainnet => Network::Bitcoin,
         SpNetwork::Testnet => Network::Testnet,
-        SpNetwork::Regtest => return Err(anyhow::anyhow!("Don't allow for regtest address"))
+        SpNetwork::Regtest => return Err(anyhow::anyhow!("Don't allow for regtest address")),
     };
     // Basically silent payments doesn't make the distinction between different testnet
     let dns_resolver = DNSHrnResolver(SocketAddr::from_str(CLOUDFLARE_DNS_RESOLVER_IP).unwrap());
-    let payment_instructions = match PaymentInstructions::parse(format!("{}@{}", user_name, domain).as_str(), core_network, &dns_resolver, true).await {
+    let payment_instructions = match PaymentInstructions::parse(
+        format!("{}@{}", user_name, domain).as_str(),
+        core_network,
+        &dns_resolver,
+        true,
+    )
+    .await
+    {
         Ok(instructions) => instructions,
         Err(e) => {
             if format!("{:?}", e).contains("Multiple TXT records") {
-                warn!("Multiple TXT records found for {}@{}. This should have been cleaned up before DNS query.", user_name, domain);
-                return Err(anyhow::anyhow!("Multiple TXT records exist for {}@{}, which is invalid. Please clean up duplicate records.", user_name, domain));
+                warn!(
+                    "Multiple TXT records found for {}@{}. This should have been cleaned up before DNS query.",
+                    user_name, domain
+                );
+                return Err(anyhow::anyhow!(
+                    "Multiple TXT records exist for {}@{}, which is invalid. Please clean up duplicate records.",
+                    user_name,
+                    domain
+                ));
             } else {
                 error!("Error parsing payment instructions: {:?}", e);
                 match e {
-                    bitcoin_payment_instructions::ParseError::HrnResolutionError(_) => return Ok(None), // We can't find a record for this user name
-                    _ => return Err(anyhow::anyhow!("Error parsing payment instructions: {:?}", e))
+                    bitcoin_payment_instructions::ParseError::HrnResolutionError(_) => {
+                        return Ok(None);
+                    } // We can't find a record for this user name
+                    _ => {
+                        return Err(anyhow::anyhow!(
+                            "Error parsing payment instructions: {:?}",
+                            e
+                        ));
+                    }
                 }
             }
         }
@@ -108,18 +134,19 @@ async fn fetch_sp_address_from_txt_record(
     match payment_instructions {
         PaymentInstructions::ConfigurableAmount(instructions) => {
             // The resolver is pretty much useless here since we're only interested in silent payment
-            let hrn_resolver = DNSHrnResolver(dns_resolver.0); 
+            let hrn_resolver = DNSHrnResolver(dns_resolver.0);
             let dummy_amount = Amount::from_sats(10_000).unwrap(); // Just defining something unlikely to fail in case there's a lnurl in the same entry
-            let fixed_amt_instructions = match instructions.set_amount(dummy_amount, &hrn_resolver).await {
-                Ok(instructions) => instructions,
-                Err(e) => return Err(anyhow::anyhow!("Error setting amount: {:?}", e))
-            };
+            let fixed_amt_instructions =
+                match instructions.set_amount(dummy_amount, &hrn_resolver).await {
+                    Ok(instructions) => instructions,
+                    Err(e) => return Err(anyhow::anyhow!("Error setting amount: {:?}", e)),
+                };
             for method in fixed_amt_instructions.methods().iter() {
                 match method {
                     PaymentMethod::SilentPayment(sp_address) => {
-                        return Ok(Some(sp_address.clone()));
-                    },
-                    _ => continue
+                        return Ok(Some(*sp_address));
+                    }
+                    _ => continue,
                 }
             }
         }
@@ -127,9 +154,9 @@ async fn fetch_sp_address_from_txt_record(
             for method in instructions.methods().iter() {
                 match method {
                     PaymentMethod::SilentPayment(sp_address) => {
-                        return Ok(Some(sp_address.clone()));
-                    },
-                    _ => continue
+                        return Ok(Some(*sp_address));
+                    }
+                    _ => continue,
                 }
             }
         }
@@ -146,10 +173,10 @@ async fn create_txt_record(
     content: &str,
 ) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
     let url = format!("{}/zones/{}/dns_records", CLOUDFLARE_API_BASE_URL, zone_id);
-    
+
     debug!("Creating TXT record: {} -> {}", name, content);
     debug!("Using Cloudflare API URL: {}", url);
-    
+
     let record = CloudflareRequest {
         record_type: "TXT".to_string(),
         name: name.to_string(),
@@ -171,7 +198,10 @@ async fn create_txt_record(
             info!("Successfully created TXT record {} with ID: {}", name, id);
             Ok(Some(id.to_string()))
         } else {
-            warn!("Cloudflare API returned success but no record ID for {}", name);
+            warn!(
+                "Cloudflare API returned success but no record ID for {}",
+                name
+            );
             Ok(None)
         }
     } else {
@@ -183,6 +213,7 @@ async fn create_txt_record(
 
 #[derive(Debug, Deserialize)]
 struct Record {
+    #[allow(unused)]
     id: String,
     name: String,
     #[serde(rename = "type")]
@@ -193,6 +224,7 @@ struct Record {
 
 #[derive(Debug, Deserialize)]
 struct ApiResponse {
+    #[allow(unused)]
     success: bool,
     result: Vec<Record>,
     // skip result_info, errors, messages, ...
@@ -203,7 +235,10 @@ async fn list_bitcoin_records(
     api_token: &str,
 ) -> Result<Vec<Record>, Box<dyn std::error::Error + Send + Sync>> {
     let url = format!("{}/zones/{}/dns_records", CLOUDFLARE_API_BASE_URL, zone_id);
-    info!("Listing Bitcoin TXT records from Cloudflare API URL: {}", url);
+    info!(
+        "Listing Bitcoin TXT records from Cloudflare API URL: {}",
+        url
+    );
     let client = Client::new();
     let resp = client
         .get(&url)
@@ -214,9 +249,13 @@ async fn list_bitcoin_records(
         .send()
         .await?
         .error_for_status()?
-        .json::<ApiResponse>().await?;
+        .json::<ApiResponse>()
+        .await?;
 
-    info!("Received {} Bitcoin TXT records from Cloudflare", resp.result.len());
+    info!(
+        "Received {} Bitcoin TXT records from Cloudflare",
+        resp.result.len()
+    );
 
     debug!("Received Bitcoin TXT records: {:?}", resp.result);
 
@@ -236,57 +275,56 @@ async fn handle_register(
     State(state): State<Arc<AppState>>,
     Json(request): Json<RegisterRequest>,
 ) -> (StatusCode, AxumJson<RegisterResponse>) {
-    let dns_record_id;
-    
     // Just in case
     if state.zone_id.is_empty() || state.api_token.is_empty() {
         error!("Cloudflare credentials missing, DNS record creation failed");
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                AxumJson(RegisterResponse {
-                    id: request.id,
-                    message: "Internal server error, please try again later".to_string(),
-                    dana_address: None,
-                    sp_address: None,
-                    dns_record_id: None,
-                })
-            );
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            AxumJson(RegisterResponse {
+                id: request.id,
+                message: "Internal server error, please try again later".to_string(),
+                dana_address: None,
+                sp_address: None,
+                dns_record_id: None,
+            }),
+        );
     }
 
     // If the domain asked by client is not the domain we're registering for, we return a bad request
     if request.domain != state.domain {
-            return (
-                StatusCode::BAD_REQUEST,
-                AxumJson(RegisterResponse {
-                    id: request.id,
-                    message: format!("Server registers for domain: {}", state.domain),
-                    dana_address: None,
-                    sp_address: None,
-                    dns_record_id: None,
-                })
-            )
+        return (
+            StatusCode::BAD_REQUEST,
+            AxumJson(RegisterResponse {
+                id: request.id,
+                message: format!("Server registers for domain: {}", state.domain),
+                dana_address: None,
+                sp_address: None,
+                dns_record_id: None,
+            }),
+        );
     }
 
     // Validate SP address
-    let sp_address = match silentpayments::SilentPaymentAddress::try_from(request.sp_address.clone()) {
-        Ok(sp_address) => {
-            debug!("Valid SP address: {}", sp_address);
-            sp_address
-        }
-        Err(e) => {
-            error!("Invalid SP address '{}': {}", request.sp_address, e);
-            return (
-                StatusCode::BAD_REQUEST,
-                AxumJson(RegisterResponse {
-                    id: request.id,
-                    message: format!("Invalid SP address: {}", e),
-                    dana_address: None,
-                    sp_address: None,
-                    dns_record_id: None,
-                })
-            );
-        }
-    };
+    let sp_address =
+        match silentpayments::SilentPaymentAddress::try_from(request.sp_address.clone()) {
+            Ok(sp_address) => {
+                debug!("Valid SP address: {}", sp_address);
+                sp_address
+            }
+            Err(e) => {
+                error!("Invalid SP address '{}': {}", request.sp_address, e);
+                return (
+                    StatusCode::BAD_REQUEST,
+                    AxumJson(RegisterResponse {
+                        id: request.id,
+                        message: format!("Invalid SP address: {}", e),
+                        dana_address: None,
+                        sp_address: None,
+                        dns_record_id: None,
+                    }),
+                );
+            }
+        };
 
     // We modify the key depending on the network we're on (mainnet vs signet/testnet)
     let network_key = match sp_address.get_network() {
@@ -297,11 +335,11 @@ async fn handle_register(
                 StatusCode::BAD_REQUEST,
                 AxumJson(RegisterResponse {
                     id: request.id,
-                    message: format!("Can't register regtest addresses"),
+                    message: "Can't register regtest addresses".to_string(),
                     dana_address: None,
                     sp_address: None,
                     dns_record_id: None,
-                })
+                }),
             );
         }
     };
@@ -316,11 +354,11 @@ async fn handle_register(
                 StatusCode::BAD_REQUEST,
                 AxumJson(RegisterResponse {
                     id: request.id,
-                    message: format!("User name is required"),
+                    message: "User name is required".to_string(),
                     dana_address: None,
                     sp_address: None,
                     dns_record_id: None,
-                })
+                }),
             );
         }
     };
@@ -330,21 +368,26 @@ async fn handle_register(
     let txt_content = format!("bitcoin:?{}={}", network_key, sp_address.to_string());
 
     // First check if the record already exists using DNS-over-HTTPS
-    match fetch_sp_address_from_txt_record(&user_name, &state.domain, sp_address.get_network()).await {
+    match fetch_sp_address_from_txt_record(&user_name, &state.domain, sp_address.get_network())
+        .await
+    {
         Ok(Some(registered_sp_address)) => {
             if registered_sp_address == sp_address {
                 // The record already exists and the SP address is the same, we can return the existing record
                 // Update maps to ensure they're in sync
                 let mut sp_map = state.sp_to_dana.write().await;
                 let mut dana_map = state.dana_to_sp.write().await;
-                let existing = sp_map.entry(sp_address.clone()).or_insert_with(Vec::new);
+                let existing = sp_map.entry(sp_address).or_insert_with(Vec::new);
                 if !existing.contains(&dana_address) {
                     existing.push(dana_address.clone());
                 }
-                dana_map.insert(dana_address.clone(), sp_address.clone());
+                dana_map.insert(dana_address.clone(), sp_address);
                 drop(sp_map);
                 drop(dana_map);
-                debug!("Updated maps for existing record: {} -> {}", dana_address, sp_address);
+                debug!(
+                    "Updated maps for existing record: {} -> {}",
+                    dana_address, sp_address
+                );
                 return (
                     StatusCode::OK,
                     AxumJson(RegisterResponse {
@@ -353,7 +396,7 @@ async fn handle_register(
                         dana_address: Some(dana_address),
                         sp_address: Some(sp_address.to_string()),
                         dns_record_id: None,
-                    })
+                    }),
                 );
             }
             error!("TXT record already exists for user name: {}", user_name);
@@ -365,12 +408,19 @@ async fn handle_register(
                     dana_address: Some(format!("{}@{}", user_name, state.domain)),
                     sp_address: Some(sp_address.to_string()),
                     dns_record_id: None, // We don't have the Cloudflare record ID from DNS check
-                })
+                }),
             );
         }
-        Ok(None) => debug!("Didn't find a sp address for network {:?} and user name {}", sp_address.get_network(), user_name),
+        Ok(None) => debug!(
+            "Didn't find a sp address for network {:?} and user name {}",
+            sp_address.get_network(),
+            user_name
+        ),
         Err(e) => {
-            error!("Error checking for existing TXT record for user name {}: {}", user_name, e);
+            error!(
+                "Error checking for existing TXT record for user name {}: {}",
+                user_name, e
+            );
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 AxumJson(RegisterResponse {
@@ -379,42 +429,63 @@ async fn handle_register(
                     dana_address: None,
                     sp_address: None,
                     dns_record_id: None,
-                })
+                }),
             );
         }
     };
-    
+
     info!("Attempting to create TXT record: {}", txt_name);
     let client = Client::new();
-    
-    dns_record_id = match create_txt_record(&client, &state.zone_id, &state.api_token, &txt_name, &txt_content).await {
+
+    let dns_record_id = match create_txt_record(
+        &client,
+        &state.zone_id,
+        &state.api_token,
+        &txt_name,
+        &txt_content,
+    )
+    .await
+    {
         Ok(Some(id)) => {
-            info!("Successfully created TXT record: {} -> {}", txt_name, txt_content);
+            info!(
+                "Successfully created TXT record: {} -> {}",
+                txt_name, txt_content
+            );
             // Update both maps with the new registration
             let mut sp_map = state.sp_to_dana.write().await;
             let mut dana_map = state.dana_to_sp.write().await;
-            let existing = sp_map.entry(sp_address.clone()).or_insert_with(Vec::new);
+            let existing = sp_map.entry(sp_address).or_insert_with(Vec::new);
             if !existing.contains(&dana_address) {
                 existing.push(dana_address.clone());
-                info!("Added Dana address {} to SP address {} mapping", dana_address, sp_address);
+                info!(
+                    "Added Dana address {} to SP address {} mapping",
+                    dana_address, sp_address
+                );
             }
-            dana_map.insert(dana_address.clone(), sp_address.clone());
+            dana_map.insert(dana_address.clone(), sp_address);
             drop(sp_map);
             drop(dana_map);
-            debug!("Updated maps for new registration: {} -> {}", dana_address, sp_address);
+            debug!(
+                "Updated maps for new registration: {} -> {}",
+                dana_address, sp_address
+            );
             Some(id)
         }
         Ok(None) => {
-            warn!("Failed to create TXT record: No ID returned from Cloudflare for {}", txt_name);
+            warn!(
+                "Failed to create TXT record: No ID returned from Cloudflare for {}",
+                txt_name
+            );
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 AxumJson(RegisterResponse {
                     id: request.id,
-                    message: "Failed to create DNS record: No ID returned from Cloudflare".to_string(),
+                    message: "Failed to create DNS record: No ID returned from Cloudflare"
+                        .to_string(),
                     dana_address: None,
                     sp_address: None,
                     dns_record_id: None,
-                })
+                }),
             );
         }
         Err(e) => {
@@ -427,7 +498,7 @@ async fn handle_register(
                     dana_address: None,
                     sp_address: None,
                     dns_record_id: None,
-                })
+                }),
             );
         }
     };
@@ -439,12 +510,15 @@ async fn handle_register(
         sp_address: Some(sp_address.to_string()),
         dns_record_id,
     };
-    
-    debug!("Sending response for record: {}", response_body.dana_address.as_ref().unwrap_or(&"unknown".to_string()));
-    (
-        StatusCode::OK,
-        AxumJson(response_body)
-    )
+
+    debug!(
+        "Sending response for record: {}",
+        response_body
+            .dana_address
+            .as_ref()
+            .unwrap_or(&"unknown".to_string())
+    );
+    (StatusCode::OK, AxumJson(response_body))
 }
 
 /// Lookup Dana address(es) for a given SP address
@@ -452,12 +526,19 @@ async fn handle_lookup_sp_address(
     State(state): State<Arc<AppState>>,
     Query(query): Query<LookupRequest>,
 ) -> (StatusCode, AxumJson<LookupResponse>) {
-    debug!("Lookup request received for SP address: {}", query.sp_address);
-    
+    debug!(
+        "Lookup request received for SP address: {}",
+        query.sp_address
+    );
+
     // Validate SP address
     let sp_address = match SilentPaymentAddress::try_from(query.sp_address.clone()) {
         Ok(sp_address) => {
-            debug!("Successfully parsed SP address: {} (network: {:?})", sp_address, sp_address.get_network());
+            debug!(
+                "Successfully parsed SP address: {} (network: {:?})",
+                sp_address,
+                sp_address.get_network()
+            );
             sp_address
         }
         Err(e) => {
@@ -469,7 +550,7 @@ async fn handle_lookup_sp_address(
                     message: format!("Invalid SP address: {}", e),
                     dana_address: Vec::new(),
                     sp_address: None,
-                })
+                }),
             );
         }
     };
@@ -478,12 +559,13 @@ async fn handle_lookup_sp_address(
     debug!("Looking up SP address in cache map...");
     let map = state.sp_to_dana.read().await;
     debug!("Cache map contains {} entries", map.len());
-    
+
     match map.get(&sp_address) {
         Some(dana_addresses) => {
-            info!("Found {} Dana address(es) for SP address {}: {:?}", 
-                dana_addresses.len(), 
-                sp_address, 
+            info!(
+                "Found {} Dana address(es) for SP address {}: {:?}",
+                dana_addresses.len(),
+                sp_address,
                 dana_addresses
             );
             (
@@ -493,7 +575,7 @@ async fn handle_lookup_sp_address(
                     message: "Successfully found Dana address(es)".to_string(),
                     dana_address: dana_addresses.clone(),
                     sp_address: Some(sp_address.to_string()),
-                })
+                }),
             )
         }
         None => {
@@ -505,7 +587,7 @@ async fn handle_lookup_sp_address(
                     message: "SP address not found".to_string(),
                     dana_address: Vec::new(),
                     sp_address: Some(sp_address.to_string()),
-                })
+                }),
             )
         }
     }
@@ -516,11 +598,17 @@ async fn handle_prefix_search(
     State(state): State<Arc<AppState>>,
     Query(query): Query<PrefixSearchRequest>,
 ) -> (StatusCode, AxumJson<PrefixSearchResponse>) {
-    debug!("Prefix search request received for prefix: {}", query.prefix);
-    
+    debug!(
+        "Prefix search request received for prefix: {}",
+        query.prefix
+    );
+
     // Validate prefix length (minimum 3 characters)
     if query.prefix.len() < 3 {
-        error!("Prefix too short: '{}' (minimum 3 characters required)", query.prefix);
+        error!(
+            "Prefix too short: '{}' (minimum 3 characters required)",
+            query.prefix
+        );
         return (
             StatusCode::BAD_REQUEST,
             AxumJson(PrefixSearchResponse {
@@ -529,23 +617,23 @@ async fn handle_prefix_search(
                 dana_address: Vec::new(),
                 count: 0,
                 total_count: 0,
-            })
+            }),
         );
     }
 
     // Convert prefix to lowercase for case-insensitive search
     let prefix_lower = query.prefix.to_lowercase();
-    
+
     // Search through all dana addresses using the reverse map
     debug!("Searching for dana addresses with prefix: {}", prefix_lower);
     let map = state.dana_to_sp.read().await;
     debug!("Cache map contains {} Dana address entries", map.len());
-    
+
     const MAX_RESULTS: usize = 25;
-    
+
     // Collect all matching addresses first
     let mut matching_addresses: Vec<String> = Vec::new();
-    
+
     // Iterate through all dana addresses (keys of the map)
     for dana_address in map.keys() {
         // Case-insensitive prefix match
@@ -553,29 +641,31 @@ async fn handle_prefix_search(
             matching_addresses.push(dana_address.clone());
         }
     }
-    
+
     // Sort for consistent results (no need to dedup since keys are unique)
     matching_addresses.sort();
-    
+
     // Get total count before limiting
     let total_count = matching_addresses.len();
-    
+
     // Limit to MAX_RESULTS
     let limited_addresses: Vec<String> = matching_addresses.into_iter().take(MAX_RESULTS).collect();
     let result_count = limited_addresses.len();
-    
+
     let message = if total_count > MAX_RESULTS {
-        format!("Found {} matching Dana address(es) (showing first {})", total_count, MAX_RESULTS)
+        format!(
+            "Found {} matching Dana address(es) (showing first {})",
+            total_count, MAX_RESULTS
+        )
     } else {
         format!("Found {} matching Dana address(es)", total_count)
     };
-    
-    info!("Found {} Dana address(es) matching prefix '{}' (returning {})", 
-        total_count, 
-        query.prefix,
-        result_count
+
+    info!(
+        "Found {} Dana address(es) matching prefix '{}' (returning {})",
+        total_count, query.prefix, result_count
     );
-    
+
     (
         StatusCode::OK,
         AxumJson(PrefixSearchResponse {
@@ -584,7 +674,7 @@ async fn handle_prefix_search(
             dana_address: limited_addresses,
             count: result_count,
             total_count,
-        })
+        }),
     )
 }
 
@@ -592,8 +682,7 @@ async fn handle_prefix_search(
 async fn main() {
     // Initialize logging with default level of 'info' if RUST_LOG is not set
     // RUST_LOG can still override this (e.g., RUST_LOG=debug cargo run)
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
-        .init();
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     info!("Starting Dana Name Server");
 
     if let Err(e) = dotenv::dotenv() {
@@ -603,13 +692,18 @@ async fn main() {
         info!("Successfully loaded .env file");
     }
 
-    let zone_id = std::env::var("CLOUDFLARE_ZONE_ID").expect("CLOUDFLARE_ZONE_ID environment variable is required");
-    let api_token = std::env::var("CLOUDFLARE_API_TOKEN").expect("CLOUDFLARE_API_TOKEN environment variable is required");
-    let domain = std::env::var("DOMAIN_NAME").expect("DOMAIN_NAME environment variable is required");
-    
+    let zone_id = std::env::var("CLOUDFLARE_ZONE_ID")
+        .expect("CLOUDFLARE_ZONE_ID environment variable is required");
+    let api_token = std::env::var("CLOUDFLARE_API_TOKEN")
+        .expect("CLOUDFLARE_API_TOKEN environment variable is required");
+    let domain =
+        std::env::var("DOMAIN_NAME").expect("DOMAIN_NAME environment variable is required");
+
     if zone_id.is_empty() || api_token.is_empty() {
         error!("Cloudflare credentials not provided. Can't proceed.");
-        error!("Set CLOUDFLARE_ZONE_ID and CLOUDFLARE_API_TOKEN environment variables to enable DNS integration.");
+        error!(
+            "Set CLOUDFLARE_ZONE_ID and CLOUDFLARE_API_TOKEN environment variables to enable DNS integration."
+        );
         std::process::exit(1);
     } else {
         info!("Cloudflare credentials loaded successfully");
@@ -617,20 +711,25 @@ async fn main() {
         debug!("API Token: {}...", &api_token[..8.min(api_token.len())]);
     }
 
-    let sp_to_dana: Arc<RwLock<HashMap<SilentPaymentAddress, Vec<String>>>> = Arc::new(RwLock::new(HashMap::new()));
-    let dana_to_sp: Arc<RwLock<HashMap<String, SilentPaymentAddress>>> = Arc::new(RwLock::new(HashMap::new()));
-    
+    let sp_to_dana: Arc<RwLock<HashMap<SilentPaymentAddress, Vec<String>>>> =
+        Arc::new(RwLock::new(HashMap::new()));
+    let dana_to_sp: Arc<RwLock<HashMap<String, SilentPaymentAddress>>> =
+        Arc::new(RwLock::new(HashMap::new()));
+
     // Populate the maps of sp addresses to dana addresses and vice versa on startup
     info!("Populating SP address to Dana address maps from Cloudflare records...");
     match list_bitcoin_records(&zone_id, &api_token).await {
         Ok(records) => {
-            info!("Fetched {} Bitcoin TXT records from Cloudflare", records.len());
+            info!(
+                "Fetched {} Bitcoin TXT records from Cloudflare",
+                records.len()
+            );
             let mut map = sp_to_dana.write().await;
             let mut reverse_map = dana_to_sp.write().await;
             let mut processed_count = 0;
             let mut skipped_count = 0;
             let mut error_count = 0;
-            
+
             for record in records {
                 // Content may be serialized as a json string. If so, we first deserialize (remove the '"').
                 let content = match serde_json::from_str::<String>(&record.content) {
@@ -648,14 +747,17 @@ async fn main() {
                 if let Some(pattern_pos) = record.name.find(pattern) {
                     let user_name = &record.name[..pattern_pos];
                     let dana_address = format!("{}@{}", user_name, domain);
-                    debug!("Extracted user_name: '{}', Dana address: '{}'", user_name, dana_address);
-                    
+                    debug!(
+                        "Extracted user_name: '{}', Dana address: '{}'",
+                        user_name, dana_address
+                    );
+
                     // Parse record content: bitcoin:?{network_key}={sp_address}
                     // Extract SP address from content
                     if let Some(sp_part) = content.strip_prefix("bitcoin:?") {
                         debug!("Found bitcoin: prefix, parsing parameters: {}", sp_part);
                         let mut found_sp = false;
-                        
+
                         // Try to find sp= or tsp= parameter
                         for param in sp_part.split('&') {
                             if let Some(sp_addr_str) = param.strip_prefix("sp=") {
@@ -663,11 +765,13 @@ async fn main() {
                                 match SilentPaymentAddress::try_from(sp_addr_str.to_string()) {
                                     Ok(sp_address) => {
                                         let dana_addr = dana_address.clone();
-                                        let existing = map.entry(sp_address.clone()).or_insert_with(Vec::new);
+                                        let existing =
+                                            map.entry(sp_address).or_insert_with(Vec::new);
                                         existing.push(dana_addr.clone());
-                                        reverse_map.insert(dana_addr.clone(), sp_address.clone());
-                                        info!("Mapped SP address {} to Dana address {} (total mappings for this SP: {})", 
-                                            sp_addr_str, 
+                                        reverse_map.insert(dana_addr.clone(), sp_address);
+                                        info!(
+                                            "Mapped SP address {} to Dana address {} (total mappings for this SP: {})",
+                                            sp_addr_str,
                                             &dana_address,
                                             existing.len()
                                         );
@@ -676,10 +780,9 @@ async fn main() {
                                         break;
                                     }
                                     Err(e) => {
-                                        warn!("Failed to parse SP address '{}' from record '{}': {}", 
-                                            sp_addr_str, 
-                                            record.name, 
-                                            e
+                                        warn!(
+                                            "Failed to parse SP address '{}' from record '{}': {}",
+                                            sp_addr_str, record.name, e
                                         );
                                         error_count += 1;
                                     }
@@ -689,11 +792,13 @@ async fn main() {
                                 match SilentPaymentAddress::try_from(sp_addr_str.to_string()) {
                                     Ok(sp_address) => {
                                         let dana_addr = dana_address.clone();
-                                        let existing = map.entry(sp_address.clone()).or_insert_with(Vec::new);
+                                        let existing =
+                                            map.entry(sp_address).or_insert_with(Vec::new);
                                         existing.push(dana_addr.clone());
-                                        reverse_map.insert(dana_addr.clone(), sp_address.clone());
-                                        info!("Mapped SP address {} to Dana address {} (total mappings for this SP: {})", 
-                                            sp_addr_str, 
+                                        reverse_map.insert(dana_addr.clone(), sp_address);
+                                        info!(
+                                            "Mapped SP address {} to Dana address {} (total mappings for this SP: {})",
+                                            sp_addr_str,
                                             &dana_address,
                                             existing.len()
                                         );
@@ -702,41 +807,53 @@ async fn main() {
                                         break;
                                     }
                                     Err(e) => {
-                                        warn!("Failed to parse SP address '{}' from record '{}': {}", 
-                                            sp_addr_str, 
-                                            record.name, 
-                                            e
+                                        warn!(
+                                            "Failed to parse SP address '{}' from record '{}': {}",
+                                            sp_addr_str, record.name, e
                                         );
                                         error_count += 1;
                                     }
                                 }
                             }
                         }
-                        
+
                         if !found_sp {
-                            debug!("No valid sp= or tsp= parameter found in record '{}'", record.name);
+                            debug!(
+                                "No valid sp= or tsp= parameter found in record '{}'",
+                                record.name
+                            );
                             skipped_count += 1;
                         }
                     } else {
-                        debug!("Record '{}' does not start with 'bitcoin:?' prefix, skipping", record.name);
+                        debug!(
+                            "Record '{}' does not start with 'bitcoin:?' prefix, skipping",
+                            record.name
+                        );
                         skipped_count += 1;
                     }
                 } else {
-                    debug!("Record '{}' does not match expected pattern '.user._bitcoin-payment.', skipping", record.name);
+                    debug!(
+                        "Record '{}' does not match expected pattern '.user._bitcoin-payment.', skipping",
+                        record.name
+                    );
                     skipped_count += 1;
                 }
             }
-            
-            info!("Map population complete: {} SP->Dana entries, {} Dana->SP entries, {} records processed, {} skipped, {} errors", 
+
+            info!(
+                "Map population complete: {} SP->Dana entries, {} Dana->SP entries, {} records processed, {} skipped, {} errors",
                 map.len(),
                 reverse_map.len(),
-                processed_count, 
-                skipped_count, 
+                processed_count,
+                skipped_count,
                 error_count
             );
         }
         Err(e) => {
-            warn!("Failed to populate SP address map on startup: {}. Continuing without cache.", e);
+            warn!(
+                "Failed to populate SP address map on startup: {}. Continuing without cache.",
+                e
+            );
         }
     }
 
@@ -753,19 +870,17 @@ async fn main() {
         .route("/lookup", get(handle_lookup_sp_address))
         .route("/search", get(handle_prefix_search));
 
-    let app = Router::new()
-        .nest("/v1", v1_router)
-        .with_state(state);
+    let app = Router::new().nest("/v1", v1_router).with_state(state);
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:8080")
         .await
         .expect("Failed to bind to port 8080");
-    
+
     info!("Server starting on http://127.0.0.1:8080");
     info!("API endpoint available at: http://127.0.0.1:8080/v1/register");
     info!("API endpoint available at: http://127.0.0.1:8080/v1/lookup");
     info!("API endpoint available at: http://127.0.0.1:8080/v1/search");
-    
+
     axum::serve(listener, app)
         .await
         .expect("Failed to start server");
@@ -779,36 +894,51 @@ mod tests {
     #[tokio::test]
     async fn test_check_txt_record_exists_with_address() {
         let address_to_register = SilentPaymentAddress::try_from("sp1qq0cygnetgn3rz2kla5cp05nj5uetlsrzez0l4p8g7wehf7ldr93lcqadw65upymwzvp5ed38l8ur2rznd6934xh95msevwrdwtrpk372hyz4vr6g").unwrap();
-        let result = fetch_sp_address_from_txt_record("donate", "danawallet.app", address_to_register.get_network()).await;
+        let result = fetch_sp_address_from_txt_record(
+            "donate",
+            "danawallet.app",
+            address_to_register.get_network(),
+        )
+        .await;
 
-        assert!(result.is_ok()); 
+        assert!(result.is_ok());
 
         assert_eq!(result.unwrap(), Some(address_to_register));
     }
 
     #[tokio::test]
     async fn test_check_txt_record_does_not_exist() {
-        let result = fetch_sp_address_from_txt_record("invalid", "danawallet.app", SpNetwork::Mainnet).await;
+        let result =
+            fetch_sp_address_from_txt_record("invalid", "danawallet.app", SpNetwork::Mainnet).await;
 
-        assert!(result.is_ok()); 
+        assert!(result.is_ok());
 
         assert_eq!(result.unwrap(), None);
     }
 
     #[tokio::test]
     async fn test_check_txt_record_exists_with_no_address() {
-        let result = fetch_sp_address_from_txt_record("matt", "mattcorallo.com", silentpayments::Network::Mainnet).await;
+        let result = fetch_sp_address_from_txt_record(
+            "matt",
+            "mattcorallo.com",
+            silentpayments::Network::Mainnet,
+        )
+        .await;
 
-        assert!(result.is_ok()); 
+        assert!(result.is_ok());
 
         assert_eq!(result.unwrap(), None);
     }
-    
-    
+
     #[tokio::test]
     async fn test_check_no_txt_record() {
-        let result = fetch_sp_address_from_txt_record("unknown", "danawallet.app", silentpayments::Network::Mainnet).await;
+        let result = fetch_sp_address_from_txt_record(
+            "unknown",
+            "danawallet.app",
+            silentpayments::Network::Mainnet,
+        )
+        .await;
 
-        assert!(result.is_err()); 
+        assert!(result.is_err());
     }
 }
