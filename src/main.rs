@@ -144,7 +144,7 @@ async fn fetch_sp_address_from_txt_record(
             for method in fixed_amt_instructions.methods().iter() {
                 match method {
                     PaymentMethod::SilentPayment(sp_address) => {
-                        return Ok(Some(sp_address.clone()));
+                        return Ok(Some(*sp_address));
                     }
                     _ => continue,
                 }
@@ -154,7 +154,7 @@ async fn fetch_sp_address_from_txt_record(
             for method in instructions.methods().iter() {
                 match method {
                     PaymentMethod::SilentPayment(sp_address) => {
-                        return Ok(Some(sp_address.clone()));
+                        return Ok(Some(*sp_address));
                     }
                     _ => continue,
                 }
@@ -277,7 +277,7 @@ async fn handle_register(
     State(state): State<Arc<AppState>>,
     Json(request): Json<RegisterRequest>,
 ) -> (StatusCode, AxumJson<RegisterResponse>) {
-    let dns_record_id;
+    
 
     // Just in case
     if state.zone_id.is_empty() || state.api_token.is_empty() {
@@ -339,7 +339,7 @@ async fn handle_register(
                 StatusCode::BAD_REQUEST,
                 AxumJson(RegisterResponse {
                     id: request.id,
-                    message: format!("Can't register regtest addresses"),
+                    message: "Can't register regtest addresses".to_string(),
                     dana_address: None,
                     sp_address: None,
                     dns_record_id: None,
@@ -358,7 +358,7 @@ async fn handle_register(
                 StatusCode::BAD_REQUEST,
                 AxumJson(RegisterResponse {
                     id: request.id,
-                    message: format!("User name is required"),
+                    message: "User name is required".to_string(),
                     dana_address: None,
                     sp_address: None,
                     dns_record_id: None,
@@ -369,7 +369,7 @@ async fn handle_register(
 
     let dana_address = format!("{}@{}", user_name, state.domain);
     let txt_name = format!("{}.user._bitcoin-payment.{}", user_name, state.domain);
-    let txt_content = format!("\"bitcoin:?{}={}\"", network_key, sp_address.to_string());
+    let txt_content = format!("\"bitcoin:?{}={}\"", network_key, sp_address);
 
     // First check if the record already exists using DNS-over-HTTPS
     match fetch_sp_address_from_txt_record(&user_name, &state.domain, sp_address.get_network())
@@ -381,11 +381,11 @@ async fn handle_register(
                 // Update maps to ensure they're in sync
                 let mut sp_map = state.sp_to_dana.write().await;
                 let mut dana_map = state.dana_to_sp.write().await;
-                let existing = sp_map.entry(sp_address.clone()).or_insert_with(Vec::new);
+                let existing = sp_map.entry(sp_address).or_insert_with(Vec::new);
                 if !existing.contains(&dana_address) {
                     existing.push(dana_address.clone());
                 }
-                dana_map.insert(dana_address.clone(), sp_address.clone());
+                dana_map.insert(dana_address.clone(), sp_address);
                 drop(sp_map);
                 drop(dana_map);
                 debug!(
@@ -441,7 +441,7 @@ async fn handle_register(
     info!("Attempting to create TXT record: {}", txt_name);
     let client = Client::new();
 
-    dns_record_id = match create_txt_record(
+    let dns_record_id = match create_txt_record(
         &client,
         &state.zone_id,
         &state.api_token,
@@ -458,7 +458,7 @@ async fn handle_register(
             // Update both maps with the new registration
             let mut sp_map = state.sp_to_dana.write().await;
             let mut dana_map = state.dana_to_sp.write().await;
-            let existing = sp_map.entry(sp_address.clone()).or_insert_with(Vec::new);
+            let existing = sp_map.entry(sp_address).or_insert_with(Vec::new);
             if !existing.contains(&dana_address) {
                 existing.push(dana_address.clone());
                 info!(
@@ -466,7 +466,7 @@ async fn handle_register(
                     dana_address, sp_address
                 );
             }
-            dana_map.insert(dana_address.clone(), sp_address.clone());
+            dana_map.insert(dana_address.clone(), sp_address);
             drop(sp_map);
             drop(dana_map);
             debug!(
@@ -767,9 +767,9 @@ async fn main() {
                                     Ok(sp_address) => {
                                         let dana_addr = dana_address.clone();
                                         let existing =
-                                            map.entry(sp_address.clone()).or_insert_with(Vec::new);
+                                            map.entry(sp_address).or_insert_with(Vec::new);
                                         existing.push(dana_addr.clone());
-                                        reverse_map.insert(dana_addr.clone(), sp_address.clone());
+                                        reverse_map.insert(dana_addr.clone(), sp_address);
                                         info!(
                                             "Mapped SP address {} to Dana address {} (total mappings for this SP: {})",
                                             sp_addr_str,
@@ -794,9 +794,9 @@ async fn main() {
                                     Ok(sp_address) => {
                                         let dana_addr = dana_address.clone();
                                         let existing =
-                                            map.entry(sp_address.clone()).or_insert_with(Vec::new);
+                                            map.entry(sp_address).or_insert_with(Vec::new);
                                         existing.push(dana_addr.clone());
-                                        reverse_map.insert(dana_addr.clone(), sp_address.clone());
+                                        reverse_map.insert(dana_addr.clone(), sp_address);
                                         info!(
                                             "Mapped SP address {} to Dana address {} (total mappings for this SP: {})",
                                             sp_addr_str,
