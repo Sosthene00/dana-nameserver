@@ -213,6 +213,7 @@ async fn create_txt_record(
 
 #[derive(Debug, Deserialize)]
 struct Record {
+    #[allow(unused)]
     id: String,
     name: String,
     #[serde(rename = "type")]
@@ -223,6 +224,7 @@ struct Record {
 
 #[derive(Debug, Deserialize)]
 struct ApiResponse {
+    #[allow(unused)]
     success: bool,
     result: Vec<Record>,
     // skip result_info, errors, messages, ...
@@ -277,8 +279,6 @@ async fn handle_register(
     State(state): State<Arc<AppState>>,
     Json(request): Json<RegisterRequest>,
 ) -> (StatusCode, AxumJson<RegisterResponse>) {
-    
-
     // Just in case
     if state.zone_id.is_empty() || state.api_token.is_empty() {
         error!("Cloudflare credentials missing, DNS record creation failed");
