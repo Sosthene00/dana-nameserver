@@ -19,8 +19,8 @@ use std::{net::SocketAddr, str::FromStr, sync::Arc};
 use tokio::sync::RwLock;
 
 use crate::api_structs::{
-    ApiResponse, CloudflareRequest, LookupRequest, LookupResponse, PrefixSearchRequest,
-    PrefixSearchResponse, Record, RegisterRequest, RegisterResponse,
+    ApiResponse, CloudflareRequest, GetInfoResponse, LookupRequest, LookupResponse,
+    PrefixSearchRequest, PrefixSearchResponse, Record, RegisterRequest, RegisterResponse,
 };
 
 const CLOUDFLARE_API_BASE_URL: &str = "https://api.cloudflare.com/client/v4";
@@ -31,8 +31,21 @@ struct AppState {
     zone_id: String,
     api_token: String,
     domain: String,
+    mainnet_only: bool,
     sp_to_dana: Arc<RwLock<HashMap<SilentPaymentAddress, Vec<String>>>>,
     dana_to_sp: Arc<RwLock<HashMap<String, SilentPaymentAddress>>>,
+}
+
+async fn handle_get_info(
+    State(state): State<Arc<AppState>>,
+) -> (StatusCode, AxumJson<GetInfoResponse>) {
+    (
+        StatusCode::OK,
+        AxumJson(GetInfoResponse {
+            domain: state.domain.clone(),
+            mainnet_only: state.mainnet_only,
+        }),
+    )
 }
 
 async fn fetch_sp_address_from_txt_record(
@@ -256,6 +269,20 @@ async fn handle_register(
                 );
             }
         };
+
+    // of only allowing mainnet, reject testnet addresses
+    if state.mainnet_only && sp_address.get_network() != SpNetwork::Mainnet {
+        return (
+            StatusCode::BAD_REQUEST,
+            AxumJson(RegisterResponse {
+                id: request.id,
+                message: "Testnet not allowed".to_string(),
+                dana_address: None,
+                sp_address: None,
+                dns_record_id: None,
+            }),
+        );
+    }
 
     // We modify the key depending on the network we're on (mainnet vs signet/testnet)
     let network_key = match sp_address.get_network() {
@@ -629,6 +656,24 @@ async fn main() {
         .expect("CLOUDFLARE_API_TOKEN environment variable is required");
     let domain =
         std::env::var("DOMAIN_NAME").expect("DOMAIN_NAME environment variable is required");
+    let server_host =
+        std::env::var("SERVER_HOST").expect("SERVER_HOST environment variable is required");
+    let server_port: u32 = std::env::var("SERVER_PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .expect("SERVER_PORT environment variable is required");
+    let mainnet_only: bool = std::env::var("MAINNET_ONLY")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .expect("MAINNET_ONLY environment variable is required");
+
+    // we only have two network types: main and test
+    // we don't allow regtest, since this doesn't make sense for a public server
+    if mainnet_only {
+        info!("Allowing mainnet only");
+    } else {
+        info!("Allowing mainnet and testnet");
+    }
 
     if zone_id.is_empty() || api_token.is_empty() {
         error!("Cloudflare credentials not provided. Can't proceed.");
@@ -670,8 +715,11 @@ async fn main() {
                     Err(_) => record.content,
                 };
 
-                debug!("Processing record: name='{}', content='{}'", record.name, content);
-                
+                debug!(
+                    "Processing record: name='{}', content='{}'",
+                    record.name, content
+                );
+
                 // Parse record name: {user_name}.user._bitcoin-payment.{domain}
                 // Extract user_name from the name (user_name can contain dots)
                 let pattern = ".user._bitcoin-payment.";
@@ -792,25 +840,30 @@ async fn main() {
         zone_id,
         api_token,
         domain,
+        mainnet_only,
         sp_to_dana,
         dana_to_sp,
     });
 
     let v1_router = Router::new()
+        .route("/info", get(handle_get_info))
         .route("/register", post(handle_register))
         .route("/lookup", get(handle_lookup_sp_address))
         .route("/search", get(handle_prefix_search));
 
     let app = Router::new().nest("/v1", v1_router).with_state(state);
 
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:8080")
-        .await
-        .expect("Failed to bind to port 8080");
+    let server_addr = format!("{server_host}:{server_port}");
 
-    info!("Server starting on http://127.0.0.1:8080");
-    info!("API endpoint available at: http://127.0.0.1:8080/v1/register");
-    info!("API endpoint available at: http://127.0.0.1:8080/v1/lookup");
-    info!("API endpoint available at: http://127.0.0.1:8080/v1/search");
+    let listener = tokio::net::TcpListener::bind(&server_addr)
+        .await
+        .expect("Failed to bind to server address");
+
+    info!("Server starting on {server_addr}");
+    info!("API endpoint available at: http://{server_addr}/v1/info");
+    info!("API endpoint available at: http://{server_addr}/v1/register");
+    info!("API endpoint available at: http://{server_addr}/v1/lookup");
+    info!("API endpoint available at: http://{server_addr}/v1/search");
 
     axum::serve(listener, app)
         .await
