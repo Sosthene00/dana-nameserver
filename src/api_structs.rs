@@ -29,7 +29,7 @@ pub struct LookupRequest {
 pub struct LookupResponse {
     pub id: String,
     pub message: String,
-    pub dana_address: Vec<String>,
+    pub dana_addresses: Vec<String>,
     pub sp_address: Option<String>,
 }
 
@@ -44,7 +44,7 @@ pub struct PrefixSearchRequest {
 pub struct PrefixSearchResponse {
     pub id: String,
     pub message: String,
-    pub dana_address: Vec<String>,
+    pub dana_addresses: Vec<String>,
     pub count: usize,
     pub total_count: usize,
 }
