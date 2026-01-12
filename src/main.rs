@@ -668,14 +668,17 @@ async fn main() {
             let mut error_count = 0;
 
             for record in records {
-                // Content may be serialized as a json string. If so, we first deserialize (remove the '"').
-                let content = match serde_json::from_str::<String>(&record.content) {
-                    Ok(content) => content,
-                    // if the string is not using json formatting (wrapped in '"'), we take the raw
-                    // string instead.
-                    Err(_) => record.content,
-                };
-
+                // Since DNS records have a max length of 255 bytes, content may be split in
+                // multiple chunks, separated by a single space.
+                let content: String = record
+                    .content
+                    .split_whitespace()
+                    .map(|chunk| match serde_json::from_str(chunk) {
+                        Ok(chunk) => chunk,
+                        // if the chunk is not string-serialized, we take the raw value
+                        Err(_) => chunk,
+                    })
+                    .collect();
                 debug!(
                     "Processing record: name='{}', content='{}'",
                     record.name, content
