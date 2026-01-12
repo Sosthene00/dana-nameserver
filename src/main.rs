@@ -33,6 +33,8 @@ struct AppState {
     domain: String,
     sp_to_dana: Arc<RwLock<HashMap<SilentPaymentAddress, Vec<String>>>>,
     dana_to_sp: Arc<RwLock<HashMap<String, SilentPaymentAddress>>>,
+    // we only accept registration requests from this network
+    network: SpNetwork,
 }
 
 async fn handle_get_info(
@@ -42,7 +44,7 @@ async fn handle_get_info(
         StatusCode::OK,
         AxumJson(GetInfoResponse {
             domain: state.domain.clone(),
-            mainnet_only: state.mainnet_only,
+            network: state.network,
         }),
     )
 }
@@ -268,6 +270,23 @@ async fn handle_register(
                 );
             }
         };
+
+    if sp_address.get_network() != state.network {
+        return (
+            StatusCode::BAD_REQUEST,
+            AxumJson(RegisterResponse {
+                id: request.id,
+                message: format!(
+                    "Registered address has wrong network type: {:?}, expected: {:?}",
+                    sp_address.get_network(),
+                    state.network
+                ),
+                dana_address: None,
+                sp_address: None,
+                dns_record_id: None,
+            }),
+        );
+    }
 
     // We modify the key depending on the network we're on (mainnet vs signet/testnet)
     let network_key = match sp_address.get_network() {
@@ -647,6 +666,16 @@ async fn main() {
         .ok()
         .and_then(|p| p.parse().ok())
         .expect("SERVER_PORT environment variable is required");
+    let network: String =
+        std::env::var("NETWORK").expect("NETWORK environemnt variable is required");
+
+    // we don't allow regtest for a public server
+    let network = match &network[..] {
+        "Mainnet" => SpNetwork::Mainnet,
+        "Testnet" => SpNetwork::Testnet,
+        "Regtest" => panic!("Regtest not allowed"),
+        _ => panic!("Unable to parse network"),
+    };
 
     if zone_id.is_empty() || api_token.is_empty() {
         error!("Cloudflare credentials not provided. Can't proceed.");
@@ -818,6 +847,7 @@ async fn main() {
         domain,
         sp_to_dana,
         dana_to_sp,
+        network,
     });
 
     let v1_router = Router::new()

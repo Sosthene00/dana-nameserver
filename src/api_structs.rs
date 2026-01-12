@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use silentpayments::Network;
 
 // Register endpoint types
 #[derive(Deserialize, Serialize)]
@@ -80,5 +81,5 @@ pub struct ApiResponse {
 #[derive(Serialize)]
 pub struct GetInfoResponse {
     pub domain: String,
-    pub mainnet_only: bool,
+    pub network: Network,
 }
