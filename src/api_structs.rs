@@ -76,3 +76,9 @@ pub struct ApiResponse {
     pub result: Vec<Record>,
     // skip result_info, errors, messages, ...
 }
+
+#[derive(Serialize)]
+pub struct GetInfoResponse {
+    pub domain: String,
+    pub mainnet_only: bool,
+}

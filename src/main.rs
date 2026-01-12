@@ -19,8 +19,8 @@ use std::{net::SocketAddr, str::FromStr, sync::Arc};
 use tokio::sync::RwLock;
 
 use crate::api_structs::{
-    ApiResponse, CloudflareRequest, LookupRequest, LookupResponse, PrefixSearchRequest,
-    PrefixSearchResponse, Record, RegisterRequest, RegisterResponse,
+    ApiResponse, CloudflareRequest, GetInfoResponse, LookupRequest, LookupResponse,
+    PrefixSearchRequest, PrefixSearchResponse, Record, RegisterRequest, RegisterResponse,
 };
 
 const CLOUDFLARE_API_BASE_URL: &str = "https://api.cloudflare.com/client/v4";
@@ -33,6 +33,18 @@ struct AppState {
     domain: String,
     sp_to_dana: Arc<RwLock<HashMap<SilentPaymentAddress, Vec<String>>>>,
     dana_to_sp: Arc<RwLock<HashMap<String, SilentPaymentAddress>>>,
+}
+
+async fn handle_get_info(
+    State(state): State<Arc<AppState>>,
+) -> (StatusCode, AxumJson<GetInfoResponse>) {
+    (
+        StatusCode::OK,
+        AxumJson(GetInfoResponse {
+            domain: state.domain.clone(),
+            mainnet_only: state.mainnet_only,
+        }),
+    )
 }
 
 async fn fetch_sp_address_from_txt_record(
@@ -809,6 +821,7 @@ async fn main() {
     });
 
     let v1_router = Router::new()
+        .route("/info", get(handle_get_info))
         .route("/register", post(handle_register))
         .route("/lookup", get(handle_lookup_sp_address))
         .route("/search", get(handle_prefix_search));
@@ -822,6 +835,7 @@ async fn main() {
         .expect("Failed to bind to server address");
 
     info!("Server starting on {server_addr}");
+    info!("API endpoint available at: http://{server_addr}/v1/info");
     info!("API endpoint available at: http://{server_addr}/v1/register");
     info!("API endpoint available at: http://{server_addr}/v1/lookup");
     info!("API endpoint available at: http://{server_addr}/v1/search");
