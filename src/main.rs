@@ -629,6 +629,12 @@ async fn main() {
         .expect("CLOUDFLARE_API_TOKEN environment variable is required");
     let domain =
         std::env::var("DOMAIN_NAME").expect("DOMAIN_NAME environment variable is required");
+    let server_host =
+        std::env::var("SERVER_HOST").expect("SERVER_HOST environment variable is required");
+    let server_port: u32 = std::env::var("SERVER_PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .expect("SERVER_PORT environment variable is required");
 
     if zone_id.is_empty() || api_token.is_empty() {
         error!("Cloudflare credentials not provided. Can't proceed.");
@@ -670,8 +676,11 @@ async fn main() {
                     Err(_) => record.content,
                 };
 
-                debug!("Processing record: name='{}', content='{}'", record.name, content);
-                
+                debug!(
+                    "Processing record: name='{}', content='{}'",
+                    record.name, content
+                );
+
                 // Parse record name: {user_name}.user._bitcoin-payment.{domain}
                 // Extract user_name from the name (user_name can contain dots)
                 let pattern = ".user._bitcoin-payment.";
@@ -803,14 +812,16 @@ async fn main() {
 
     let app = Router::new().nest("/v1", v1_router).with_state(state);
 
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:8080")
-        .await
-        .expect("Failed to bind to port 8080");
+    let server_addr = format!("{server_host}:{server_port}");
 
-    info!("Server starting on http://127.0.0.1:8080");
-    info!("API endpoint available at: http://127.0.0.1:8080/v1/register");
-    info!("API endpoint available at: http://127.0.0.1:8080/v1/lookup");
-    info!("API endpoint available at: http://127.0.0.1:8080/v1/search");
+    let listener = tokio::net::TcpListener::bind(&server_addr)
+        .await
+        .expect("Failed to bind to server address");
+
+    info!("Server starting on {server_addr}");
+    info!("API endpoint available at: http://{server_addr}/v1/register");
+    info!("API endpoint available at: http://{server_addr}/v1/lookup");
+    info!("API endpoint available at: http://{server_addr}/v1/search");
 
     axum::serve(listener, app)
         .await
