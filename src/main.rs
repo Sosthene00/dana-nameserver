@@ -12,6 +12,7 @@ use bitcoin_payment_instructions::{
     Network, PaymentInstructions, PaymentMethod, amount::Amount, dns_resolver::DNSHrnResolver,
 };
 use log::{debug, error, info, warn};
+use rand::RngCore;
 use reqwest::Client;
 use silentpayments::{Network as SpNetwork, SilentPaymentAddress};
 use std::collections::HashMap;
@@ -238,6 +239,121 @@ async fn list_bitcoin_records(
 async fn cleanup_expired_nonces(nonce_store: &Arc<RwLock<HashMap<String, NonceEntry>>>) {
     let mut store = nonce_store.write().await;
     store.retain(|_, entry| !entry.is_expired());
+}
+
+/// Prepare a nonce for challenge-response registration authentication
+async fn handle_register_prepare(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<RegisterPrepareRequest>,
+) -> (StatusCode, AxumJson<RegisterPrepareResponse>) {
+    // Validate domain matches state domain
+    if request.domain != state.domain {
+        return (
+            StatusCode::BAD_REQUEST,
+            AxumJson(RegisterPrepareResponse {
+                id: request.id,
+                message: format!("Server registers for domain: {}", state.domain),
+                nonce: None,
+                error: None,
+            }),
+        );
+    }
+
+    // Validate user_name is present and non-empty
+    let user_name = match request.user_name {
+        Some(ref name) if !name.is_empty() => name.clone(),
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                AxumJson(RegisterPrepareResponse {
+                    id: request.id,
+                    message: "User name is required".to_string(),
+                    nonce: None,
+                    error: None,
+                }),
+            );
+        }
+    };
+
+    // Parse SP address
+    let sp_address = match SilentPaymentAddress::try_from(request.sp_address.clone()) {
+        Ok(sp_address) => {
+            debug!("Valid SP address: {}", sp_address);
+            sp_address
+        }
+        Err(e) => {
+            error!("Invalid SP address '{}': {}", request.sp_address, e);
+            return (
+                StatusCode::BAD_REQUEST,
+                AxumJson(RegisterPrepareResponse {
+                    id: request.id,
+                    message: format!("Invalid SP address: {}", e),
+                    nonce: None,
+                    error: None,
+                }),
+            );
+        }
+    };
+
+    // Validate SP address network matches state network
+    if sp_address.get_network() != state.network {
+        return (
+            StatusCode::BAD_REQUEST,
+            AxumJson(RegisterPrepareResponse {
+                id: request.id,
+                message: format!(
+                    "Registered address has wrong network type: {:?}, expected: {:?}",
+                    sp_address.get_network(),
+                    state.network
+                ),
+                nonce: None,
+                error: None,
+            }),
+        );
+    }
+
+    // Clean up expired nonces
+    cleanup_expired_nonces(&state.nonce_store).await;
+
+    // Generate a 32-byte random nonce
+    let mut nonce_bytes = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut nonce_bytes);
+    let nonce_hex = hex::encode(nonce_bytes);
+
+    // Store the nonce in the nonce store
+    let nonce_entry = NonceEntry {
+        user_name: user_name.clone(),
+        sp_address: sp_address.to_string(),
+        domain: state.domain.clone(),
+        expires_at: Instant::now() + Duration::from_secs(NONCE_TTL_SECS),
+    };
+
+    let mut store = state.nonce_store.write().await;
+    store.insert(nonce_hex.clone(), nonce_entry);
+    drop(store);
+
+    info!(
+        "Generated nonce for user {} on domain {} (expires in {}s)",
+        user_name, state.domain, NONCE_TTL_SECS
+    );
+
+    (
+        StatusCode::OK,
+        AxumJson(RegisterPrepareResponse {
+            id: request.id,
+            message: "Nonce generated successfully".to_string(),
+            nonce: Some(nonce_hex),
+            error: None,
+        }),
+    )
+}
+
+/// Validate that a string is a well-formed DNS label (RFC 1035).
+fn validate_dns_name(name: &str) -> bool {
+    if name.is_empty() || name.len() > 63 {
+        return false;
+    }
+    name.chars().all(|c| c.is_alphanumeric() || c == '-')
 }
 
 async fn handle_register(
@@ -880,6 +996,7 @@ async fn main() {
     let v1_router = Router::new()
         .route("/info", get(handle_get_info))
         .route("/register", post(handle_register))
+        .route("/register/prepare", post(handle_register_prepare))
         .route("/lookup", get(handle_lookup_sp_address))
         .route("/search", get(handle_prefix_search));
 
