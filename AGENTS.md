@@ -78,9 +78,24 @@ Agent: **Run `cargo test`** after non-trivial changes and include the result.
 
 ### Route Handlers
 - `GET /v1/info` — Server info (domain, network)
-- `POST /v1/register` — Register a Dana address (creates DNS TXT record)
+- `POST /v1/register/prepare` — Initiate registration, returns a challenge nonce
+- `POST /v1/register` — Register with signature proof (requires /register/prepare first)
 - `GET /v1/lookup?sp_address=...` — Lookup Dana address(es) for an SP address
 - `GET /v1/search?prefix=...` — Prefix search across Dana addresses (min 3 chars, max 25 results)
+
+### Authentication Flow
+
+Registration uses challenge-response authentication to prove ownership of the SP address:
+
+1. **Prepare** — `POST /v1/register/prepare` with `{id, domain, user_name, sp_address}`
+   → Server validates inputs and returns `{nonce}` (valid for 5 minutes)
+2. **Sign** — Client signs `"dana-register:{nonce}:{user_name}:{domain}"` with the spend private key
+   corresponding to the SP address (Schnorr signature, 64 bytes hex)
+3. **Register** — `POST /v1/register` with `{id, domain, user_name, sp_address, signature, nonce}`
+   → Server verifies nonce (exists, matches, not expired), then verifies signature, then creates DNS record
+4. **One-time** — Nonce is invalidated after use; re-attempt requires new /register/prepare call
+
+**DNS name constraints**: alphanumeric + hyphens only, 1-63 characters.
 
 ## 6. Testing Conventions
 
