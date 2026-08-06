@@ -21,7 +21,8 @@ use tokio::sync::RwLock;
 
 use crate::api_structs::{
     ApiResponse, CloudflareRequest, GetInfoResponse, LookupRequest, LookupResponse,
-    PrefixSearchRequest, PrefixSearchResponse, Record, RegisterRequest, RegisterResponse,
+    PrefixSearchRequest, PrefixSearchResponse, Record, RegisterPrepareRequest,
+    RegisterPrepareResponse, RegisterRequest, RegisterResponse,
 };
 
 const CLOUDFLARE_API_BASE_URL: &str = "https://api.cloudflare.com/client/v4";
@@ -34,6 +35,12 @@ struct NonceEntry {
     sp_address: String,
     domain: String,
     expires_at: Instant,
+}
+
+impl NonceEntry {
+    fn is_expired(&self) -> bool {
+        Instant::now() > self.expires_at
+    }
 }
 
 #[derive(Clone)]
@@ -226,6 +233,11 @@ async fn list_bitcoin_records(
     debug!("Received Bitcoin TXT records: {:?}", resp.result);
 
     Ok(resp.result)
+}
+
+async fn cleanup_expired_nonces(nonce_store: &Arc<RwLock<HashMap<String, NonceEntry>>>) {
+    let mut store = nonce_store.write().await;
+    store.retain(|_, entry| !entry.is_expired());
 }
 
 async fn handle_register(
