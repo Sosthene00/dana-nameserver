@@ -496,11 +496,9 @@ async fn handle_register(
         }
     };
 
-    // TODO verify a signature over some message that user must provides with the request
-
-    // if user_name is empty, we generate a random one
+    // Extract user_name before validation (nonce may store None)
     let user_name = match request.user_name {
-        Some(user_name) => user_name,
+        Some(name) => name,
         None => {
             return (
                 StatusCode::BAD_REQUEST,
@@ -514,6 +512,90 @@ async fn handle_register(
             );
         }
     };
+
+    // Validate nonce exists in store, matches request data, and hasn't expired
+    {
+        let store = state.nonce_store.read().await;
+        match store.get(&request.nonce) {
+            Some(entry) => {
+                if entry.is_expired() {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        AxumJson(RegisterResponse {
+                            id: request.id,
+                            message: "Registration nonce expired. Please request a new one.".to_string(),
+                            dana_address: None,
+                            sp_address: None,
+                            dns_record_id: None,
+                        }),
+                    );
+                }
+                // Validate nonce's stored data matches the request
+                if entry.user_name != user_name || entry.sp_address != request.sp_address || entry.domain != request.domain {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        AxumJson(RegisterResponse {
+                            id: request.id,
+                            message: "Nonce does not match this registration request. Request a new one.".to_string(),
+                            dana_address: None,
+                            sp_address: None,
+                            dns_record_id: None,
+                        }),
+                    );
+                }
+            }
+            None => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    AxumJson(RegisterResponse {
+                        id: request.id,
+                        message: "Invalid or missing nonce. Please call /register/prepare first.".to_string(),
+                        dana_address: None,
+                        sp_address: None,
+                        dns_record_id: None,
+                    }),
+                );
+            }
+        }
+    }
+
+    // Invalidate nonce (one-time use)
+    {
+        let mut store = state.nonce_store.write().await;
+        store.remove(&request.nonce);
+    }
+
+    // Verify signature over the nonce + user_name + domain
+    let signed_message = format!("dana-register:{}:{}:{}", request.nonce, user_name, state.domain);
+    
+    if let Err(e) = verify_schnorr_signature(&request.signature, &signed_message, &sp_address) {
+        warn!("Signature verification failed for user '{}': {}", user_name, e);
+        return (
+            StatusCode::BAD_REQUEST,
+            AxumJson(RegisterResponse {
+                id: request.id,
+                message: format!("Invalid signature: {}", e),
+                dana_address: None,
+                sp_address: None,
+                dns_record_id: None,
+            }),
+        );
+    }
+    debug!("Signature verified for user '{}'", user_name);
+
+    // Validate DNS name before creating records
+    if !validate_dns_name(&user_name) {
+        return (
+            StatusCode::BAD_REQUEST,
+            AxumJson(RegisterResponse {
+                id: request.id,
+                message: "Invalid user name (alphanumeric and hyphens only, 1-63 chars)".to_string(),
+                dana_address: None,
+                sp_address: None,
+                dns_record_id: None,
+            }),
+        );
+    }
 
     let dana_address = format!("{}@{}", user_name, state.domain);
     let txt_name = format!("{}.user._bitcoin-payment.{}", user_name, state.domain);
