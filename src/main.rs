@@ -15,6 +15,7 @@ use log::{debug, error, info, warn};
 use reqwest::Client;
 use silentpayments::{Network as SpNetwork, SilentPaymentAddress};
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
 use std::{net::SocketAddr, str::FromStr, sync::Arc};
 use tokio::sync::RwLock;
 
@@ -26,6 +27,15 @@ use crate::api_structs::{
 const CLOUDFLARE_API_BASE_URL: &str = "https://api.cloudflare.com/client/v4";
 const CLOUDFLARE_DNS_RESOLVER_IP: &str = "1.1.1.1:53";
 
+const NONCE_TTL_SECS: u64 = 300; // 5 minutes
+
+struct NonceEntry {
+    user_name: String,
+    sp_address: String,
+    domain: String,
+    expires_at: Instant,
+}
+
 #[derive(Clone)]
 struct AppState {
     zone_id: String,
@@ -35,6 +45,8 @@ struct AppState {
     dana_to_sp: Arc<RwLock<HashMap<String, SilentPaymentAddress>>>,
     // we only accept registration requests from this network
     network: SpNetwork,
+    // Challenge-response nonce store for signature auth
+    nonce_store: Arc<RwLock<HashMap<String, NonceEntry>>>,
 }
 
 async fn handle_get_info(
@@ -693,6 +705,8 @@ async fn main() {
         Arc::new(RwLock::new(HashMap::new()));
     let dana_to_sp: Arc<RwLock<HashMap<String, SilentPaymentAddress>>> =
         Arc::new(RwLock::new(HashMap::new()));
+    let nonce_store: Arc<RwLock<HashMap<String, NonceEntry>>> =
+        Arc::new(RwLock::new(HashMap::new()));
 
     // Populate the maps of sp addresses to dana addresses and vice versa on startup
     info!("Populating SP address to Dana address maps from Cloudflare records...");
@@ -848,6 +862,7 @@ async fn main() {
         sp_to_dana,
         dana_to_sp,
         network,
+        nonce_store,
     });
 
     let v1_router = Router::new()
