@@ -356,6 +356,56 @@ fn validate_dns_name(name: &str) -> bool {
     name.chars().all(|c| c.is_alphanumeric() || c == '-')
 }
 
+/// Verify a Schnorr signature over `message` using the spend public key
+/// derived from `sp_address`.
+///
+/// The message is SHA-256 hashed before verification, as required by
+/// the secp256k1 Schnorr signature scheme.
+fn verify_schnorr_signature(
+    signature_hex: &str,
+    message: &str,
+    sp_address: &SilentPaymentAddress,
+) -> Result<(), String> {
+    use secp256k1::{Message, Secp256k1, XOnlyPublicKey, schnorr::Signature};
+    use sha2::{Digest, Sha256};
+
+    // Decode hex signature
+    let sig_bytes =
+        hex::decode(signature_hex).map_err(|e| format!("Invalid signature hex: {}", e))?;
+    if sig_bytes.len() != 64 {
+        return Err(format!(
+            "Signature must be 64 bytes (got {})",
+            sig_bytes.len()
+        ));
+    }
+
+    // Parse Schnorr signature (secp256k1 0.28: schnorr::Signature, not SchnorrSig)
+    let sig =
+        Signature::from_slice(&sig_bytes)
+            .map_err(|e| format!("Invalid signature encoding: {}", e))?;
+
+    // Get spend public key from SP address and convert to XOnlyPublicKey
+    // (Schnorr signatures use X-only point compression)
+    let spend_pubkey = sp_address.get_spend_key();
+    let pk_bytes = spend_pubkey.serialize();
+    let x_only_pubkey = XOnlyPublicKey::from_slice(&pk_bytes[1..])
+        .map_err(|e| format!("Invalid X-only pubkey: {}", e))?;
+
+    // SHA-256 hash the message
+    let mut hasher = Sha256::new();
+    hasher.update(message.as_bytes());
+    let digest = hasher.finalize();
+
+    // Create message from digest
+    let msg = Message::from_digest_slice(&digest)
+        .map_err(|e| format!("Invalid digest: {}", e))?;
+
+    // Verify
+    let secp = Secp256k1::new();
+    secp.verify_schnorr(&sig, &msg, &x_only_pubkey)
+        .map_err(|e| format!("Signature verification failed: {}", e))
+}
+
 async fn handle_register(
     State(state): State<Arc<AppState>>,
     Json(request): Json<RegisterRequest>,
