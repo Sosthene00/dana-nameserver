@@ -47,6 +47,23 @@ Agent: `main.rs` is a ~930-line monolith. It contains route handlers, DNS functi
 
 ## 4. Commands That Actually Work
 
+
+### Toolchain (audit gate — non-negotiable)
+
+This workspace requires Rust >= 1.84 (`resolver = "3"`). The host carries two
+toolchains: the rustup-managed `stable` (current, pinned by `rust-toolchain.toml`
+at the repo root) and the distro `rustc` 1.75 in `/usr/bin`, which is TOO OLD.
+Non-interactive `ssh` shells do NOT source `~/.cargo/env`, so bare `cargo`/`rustc`
+resolve to 1.75 and the verification gate fails. ALWAYS invoke via the rustup shim:
+
+```bash
+~/.cargo/bin/cargo check --workspace
+~/.cargo/bin/cargo test --workspace
+~/.cargo/bin/cargo clippy --workspace
+```
+
+`rust-toolchain.toml` forces the pinned stable toolchain for these invocations.
+Never rely on bare `cargo` in remote/cron shells.
 ### Build & Run
 ```bash
 cargo build --release          # Release build (strip, LTO, opt-size)
@@ -186,8 +203,7 @@ In every response with code changes: summary, file list, commands + results, tes
 - **No persistent storage** — The SP↔Dana maps are rebuilt from Cloudflare on every startup via `list_bitcoin_records()`. Server restarts don't lose data (DNS records persist), but the in-memory cache is cold.
 - **Custom fork dependency** — `bitcoin-payment-instructions` is from a forked branch (`add_silent_payments`). Breaking changes upstream could affect this.
 - **DNS lookup is the only duplicate check** — Registration checks DNS for existing records, not the in-memory map. Race conditions between two concurrent registrations are possible.
-- **No authentication on the API** — Anyone can call `/register` and `/lookup`. This is by design but should be noted.
-- **TODO on line 309** — Signature verification over registration requests is marked as TODO but not implemented.
+- **Read endpoints are unauthenticated** — `/lookup`, `/search` and `/info` are public by design. `/register` requires challenge-response signature proof of SP address ownership (see Authentication Flow in section 5).
 - **Prefix search is O(n)** — Iterates all keys in `dana_to_sp` map. Fine for small registries, but should be flagged if scale becomes an issue.
 
 ## 11. Additional Context Files
