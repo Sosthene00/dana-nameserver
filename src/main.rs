@@ -620,7 +620,7 @@ async fn handle_register(
                 drop(dana_map);
                 debug!(
                     "Updated maps for existing record: {} -> {}",
-                    dana_address, sp_address
+                    &dana_address, sp_address
                 );
                 return (
                     StatusCode::OK,
@@ -693,7 +693,7 @@ async fn handle_register(
                 existing.push(dana_address.clone());
                 info!(
                     "Added Dana address {} to SP address {} mapping",
-                    dana_address, sp_address
+                    &dana_address, sp_address
                 );
             }
             dana_map.insert(dana_address.clone(), sp_address);
@@ -1204,7 +1204,8 @@ mod tests {
         )
         .await;
 
-        assert!(result.is_err());
+        // No TXT record => HrnResolutionError, which the function maps to Ok(None).
+        assert!(result.unwrap().is_none());
     }
 
     // ── Unit tests for signature verification, DNS name validation, nonce expiry ──
