@@ -106,7 +106,7 @@ Registration uses challenge-response authentication to prove ownership of the SP
 
 1. **Prepare** — `POST /v1/register/prepare` with `{id, domain, user_name, sp_address}`
    → Server validates inputs and returns `{nonce}` (valid for 5 minutes)
-2. **Sign** — Client signs `"dana-register:{nonce}:{user_name}:{domain}"` with the spend private key
+2. **Sign** — Client signs `"dana-register:{network_key}:{nonce}:{user_name}:{domain}"` (network_key = `sp`/`tsp` per the SP address network) with the spend private key
    corresponding to the SP address (Schnorr signature, 64 bytes hex)
 3. **Register** — `POST /v1/register` with `{id, domain, user_name, sp_address, signature, nonce}`
    → Server verifies nonce (exists, matches, not expired), then verifies signature, then creates DNS record

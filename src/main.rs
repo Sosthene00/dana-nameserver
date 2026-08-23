@@ -559,14 +559,9 @@ async fn handle_register(
         }
     }
 
-    // Invalidate nonce (one-time use)
-    {
-        let mut store = state.nonce_store.write().await;
-        store.remove(&request.nonce);
-    }
 
     // Verify signature over the nonce + user_name + domain
-    let signed_message = format!("dana-register:{}:{}:{}", request.nonce, user_name, state.domain);
+    let signed_message = format!("dana-register:{}:{}:{}:{}", network_key, request.nonce, user_name, state.domain);
     
     if let Err(e) = verify_schnorr_signature(&request.signature, &signed_message, &sp_address) {
         warn!("Signature verification failed for user '{}': {}", user_name, e);
@@ -616,6 +611,12 @@ async fn handle_register(
                     existing.push(dana_address.clone());
                 }
                 dana_map.insert(dana_address.clone(), sp_address);
+    // Consume the nonce once the registration has completed successfully
+    {
+        let mut store = state.nonce_store.write().await;
+        store.remove(&request.nonce);
+    }
+
                 drop(sp_map);
                 drop(dana_map);
                 debug!(
@@ -697,6 +698,12 @@ async fn handle_register(
                 );
             }
             dana_map.insert(dana_address.clone(), sp_address);
+    // Consume the nonce once the registration has completed successfully
+    {
+        let mut store = state.nonce_store.write().await;
+        store.remove(&request.nonce);
+    }
+
             drop(sp_map);
             drop(dana_map);
             debug!(
@@ -1223,7 +1230,7 @@ mod tests {
         let (x_only_pubkey, _parity) = XOnlyPublicKey::from_keypair(&keypair);
 
         // Hash a test message with SHA-256
-        let message = "dana-register:testnonce:testuser:testdomain.com";
+        let message = "dana-register:sp:testnonce:testuser:testdomain.com";
         let mut hasher = Sha256::new();
         hasher.update(message.as_bytes());
         let digest = hasher.finalize();
@@ -1251,7 +1258,7 @@ mod tests {
         let (pk_b, _) = XOnlyPublicKey::from_keypair(&keypair_b);
 
         // Sign with keypair_a, verify with keypair_b — should fail
-        let message = "dana-register:testnonce:testuser:testdomain.com";
+        let message = "dana-register:sp:testnonce:testuser:testdomain.com";
         let mut hasher = Sha256::new();
         hasher.update(message.as_bytes());
         let digest = hasher.finalize();
