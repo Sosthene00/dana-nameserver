@@ -256,6 +256,8 @@ async fn handle_register_prepare(
     State(state): State<Arc<AppState>>,
     Json(request): Json<RegisterPrepareRequest>,
 ) -> (StatusCode, AxumJson<RegisterPrepareResponse>) {
+    // Bound the in-memory nonce store by evicting expired entries
+    cleanup_expired_nonces(&state.nonce_store).await;
     // Validate domain matches state domain
     if request.domain != state.domain {
         return (
@@ -498,6 +500,8 @@ async fn handle_register(
     State(state): State<Arc<AppState>>,
     Json(request): Json<RegisterRequest>,
 ) -> (StatusCode, AxumJson<RegisterResponse>) {
+    // Bound the in-memory nonce store by evicting expired entries
+    cleanup_expired_nonces(&state.nonce_store).await;
     // Just in case
     if state.zone_id.is_empty() || state.api_token.is_empty() {
         error!("Cloudflare credentials missing, DNS record creation failed");
