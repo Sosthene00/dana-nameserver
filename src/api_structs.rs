@@ -67,6 +67,7 @@ pub struct Record {
     pub id: String,
     pub name: String,
     #[serde(rename = "type")]
+    #[allow(unused)]
     pub record_type: String,
     pub content: String,
     // skip other fields
