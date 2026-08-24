@@ -110,7 +110,7 @@ Registration uses challenge-response authentication to prove ownership of the SP
    corresponding to the SP address (Schnorr signature, 64 bytes hex)
 3. **Register** — `POST /v1/register` with `{id, domain, user_name, sp_address, signature, nonce}`
    → Server verifies nonce (exists, matches, not expired), then verifies signature, then creates DNS record
-4. **One-time** — Nonce is invalidated after use; re-attempt requires new /register/prepare call
+4. **Single-use on success** — The nonce is consumed only after a successful registration; a failed attempt leaves it valid so the client can retry.
 
 **DNS name constraints**: alphanumeric + hyphens only, 1-63 characters.
 

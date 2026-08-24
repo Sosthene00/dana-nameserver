@@ -274,6 +274,20 @@ async fn handle_register_prepare(
             );
         }
     };
+    // Reject DNS-invalid user names before issuing a nonce (RFC 1035: ASCII alphanumeric + hyphens, 1-63)
+    if !validate_dns_name(&user_name) {
+        return (
+            StatusCode::BAD_REQUEST,
+            AxumJson(RegisterPrepareResponse {
+                id: request.id,
+                message:
+                    "Invalid user name: must be ASCII alphanumeric and hyphens only, 1-63 chars"
+                        .to_string(),
+                nonce: None,
+                error: None,
+            }),
+        );
+    }
 
     // Parse SP address
     let sp_address = match SilentPaymentAddress::try_from(request.sp_address.clone()) {
@@ -353,7 +367,7 @@ fn validate_dns_name(name: &str) -> bool {
     if name.is_empty() || name.len() > 63 {
         return false;
     }
-    name.chars().all(|c| c.is_alphanumeric() || c == '-')
+    name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
 }
 
 /// Verify a Schnorr signature over `message` using the spend public key
@@ -380,9 +394,8 @@ fn verify_schnorr_signature(
     }
 
     // Parse Schnorr signature (secp256k1 0.28: schnorr::Signature, not SchnorrSig)
-    let sig =
-        Signature::from_slice(&sig_bytes)
-            .map_err(|e| format!("Invalid signature encoding: {}", e))?;
+    let sig = Signature::from_slice(&sig_bytes)
+        .map_err(|e| format!("Invalid signature encoding: {}", e))?;
 
     // Get spend public key from SP address and convert to XOnlyPublicKey
     // (Schnorr signatures use X-only point compression)
@@ -397,8 +410,7 @@ fn verify_schnorr_signature(
     let digest = hasher.finalize();
 
     // Create message from digest
-    let msg = Message::from_digest_slice(&digest)
-        .map_err(|e| format!("Invalid digest: {}", e))?;
+    let msg = Message::from_digest_slice(&digest).map_err(|e| format!("Invalid digest: {}", e))?;
 
     // Verify
     let secp = Secp256k1::new();
@@ -523,7 +535,8 @@ async fn handle_register(
                         StatusCode::BAD_REQUEST,
                         AxumJson(RegisterResponse {
                             id: request.id,
-                            message: "Registration nonce expired. Please request a new one.".to_string(),
+                            message: "Registration nonce expired. Please request a new one."
+                                .to_string(),
                             dana_address: None,
                             sp_address: None,
                             dns_record_id: None,
@@ -531,12 +544,17 @@ async fn handle_register(
                     );
                 }
                 // Validate nonce's stored data matches the request
-                if entry.user_name != user_name || entry.sp_address != request.sp_address || entry.domain != request.domain {
+                if entry.user_name != user_name
+                    || entry.sp_address != request.sp_address
+                    || entry.domain != request.domain
+                {
                     return (
                         StatusCode::BAD_REQUEST,
                         AxumJson(RegisterResponse {
                             id: request.id,
-                            message: "Nonce does not match this registration request. Request a new one.".to_string(),
+                            message:
+                                "Nonce does not match this registration request. Request a new one."
+                                    .to_string(),
                             dana_address: None,
                             sp_address: None,
                             dns_record_id: None,
@@ -549,7 +567,8 @@ async fn handle_register(
                     StatusCode::BAD_REQUEST,
                     AxumJson(RegisterResponse {
                         id: request.id,
-                        message: "Invalid or missing nonce. Please call /register/prepare first.".to_string(),
+                        message: "Invalid or missing nonce. Please call /register/prepare first."
+                            .to_string(),
                         dana_address: None,
                         sp_address: None,
                         dns_record_id: None,
@@ -559,12 +578,17 @@ async fn handle_register(
         }
     }
 
-
     // Verify signature over the nonce + user_name + domain
-    let signed_message = format!("dana-register:{}:{}:{}:{}", network_key, request.nonce, user_name, state.domain);
-    
+    let signed_message = format!(
+        "dana-register:{}:{}:{}:{}",
+        network_key, request.nonce, user_name, state.domain
+    );
+
     if let Err(e) = verify_schnorr_signature(&request.signature, &signed_message, &sp_address) {
-        warn!("Signature verification failed for user '{}': {}", user_name, e);
+        warn!(
+            "Signature verification failed for user '{}': {}",
+            user_name, e
+        );
         return (
             StatusCode::BAD_REQUEST,
             AxumJson(RegisterResponse {
@@ -584,7 +608,8 @@ async fn handle_register(
             StatusCode::BAD_REQUEST,
             AxumJson(RegisterResponse {
                 id: request.id,
-                message: "Invalid user name (alphanumeric and hyphens only, 1-63 chars)".to_string(),
+                message: "Invalid user name (alphanumeric and hyphens only, 1-63 chars)"
+                    .to_string(),
                 dana_address: None,
                 sp_address: None,
                 dns_record_id: None,
@@ -611,11 +636,11 @@ async fn handle_register(
                     existing.push(dana_address.clone());
                 }
                 dana_map.insert(dana_address.clone(), sp_address);
-    // Consume the nonce once the registration has completed successfully
-    {
-        let mut store = state.nonce_store.write().await;
-        store.remove(&request.nonce);
-    }
+                // Consume the nonce once the registration has completed successfully
+                {
+                    let mut store = state.nonce_store.write().await;
+                    store.remove(&request.nonce);
+                }
 
                 drop(sp_map);
                 drop(dana_map);
@@ -698,11 +723,11 @@ async fn handle_register(
                 );
             }
             dana_map.insert(dana_address.clone(), sp_address);
-    // Consume the nonce once the registration has completed successfully
-    {
-        let mut store = state.nonce_store.write().await;
-        store.remove(&request.nonce);
-    }
+            // Consume the nonce once the registration has completed successfully
+            {
+                let mut store = state.nonce_store.write().await;
+                store.remove(&request.nonce);
+            }
 
             drop(sp_map);
             drop(dana_map);
@@ -1278,6 +1303,10 @@ mod tests {
         assert!(!validate_dns_name("alice@domain")); // @
         assert!(!validate_dns_name(&"a".repeat(64))); // max 63
         assert!(validate_dns_name(&"a".repeat(63))); // exactly 63
+        // Reject non-ASCII (Unicode) labels — RFC 1035 names are ASCII
+        assert!(!validate_dns_name("é"));
+        assert!(!validate_dns_name("日本語"));
+        assert!(!validate_dns_name("café"));
     }
 
     #[test]
