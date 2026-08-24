@@ -627,7 +627,7 @@ async fn handle_register(
                 drop(dana_map);
                 debug!(
                     "Updated maps for existing record: {} -> {}",
-                    dana_address, sp_address
+                    &dana_address, sp_address
                 );
                 return (
                     StatusCode::OK,
@@ -700,7 +700,7 @@ async fn handle_register(
                 existing.push(dana_address.clone());
                 info!(
                     "Added Dana address {} to SP address {} mapping",
-                    dana_address, sp_address
+                    &dana_address, sp_address
                 );
             }
             dana_map.insert(dana_address.clone(), sp_address);
@@ -1213,7 +1213,92 @@ mod tests {
         )
         .await;
 
-        assert!(result.is_err());
+        // No TXT record => HrnResolutionError, which the function maps to Ok(None).
+        assert!(result.unwrap().is_none());
+    }
+
+    // ── Unit tests for signature verification, DNS name validation, nonce expiry ──
+
+    #[test]
+    fn test_verify_schnorr_signature_valid() {
+        use secp256k1::{Keypair, Secp256k1, SecretKey, XOnlyPublicKey};
+        use sha2::{Digest, Sha256};
+
+        let secp = Secp256k1::new();
+
+        // Generate a random keypair
+        let secret_key = SecretKey::new(&mut rand::thread_rng());
+        let keypair = Keypair::from_seckey_slice(&secp, secret_key.as_ref()).unwrap();
+        let (x_only_pubkey, _parity) = XOnlyPublicKey::from_keypair(&keypair);
+
+        // Hash a test message with SHA-256
+        let message = "dana-register:testnonce:testuser:testdomain.com";
+        let mut hasher = Sha256::new();
+        hasher.update(message.as_bytes());
+        let digest = hasher.finalize();
+        let msg = secp256k1::Message::from_digest_slice(&digest).unwrap();
+
+        // Sign with an RNG and verify
+        let sig = secp.sign_schnorr_with_rng(&msg, &keypair, &mut rand::thread_rng());
+        assert!(secp.verify_schnorr(&sig, &msg, &x_only_pubkey).is_ok());
+    }
+
+    #[test]
+    fn test_verify_schnorr_signature_invalid() {
+        use secp256k1::{Keypair, Secp256k1, SecretKey, XOnlyPublicKey};
+        use sha2::{Digest, Sha256};
+
+        let secp = Secp256k1::new();
+
+        // Generate two different keypairs
+        let sk_a = SecretKey::new(&mut rand::thread_rng());
+        let keypair_a = Keypair::from_seckey_slice(&secp, sk_a.as_ref()).unwrap();
+        let (pk_a, _) = XOnlyPublicKey::from_keypair(&keypair_a);
+
+        let sk_b = SecretKey::new(&mut rand::thread_rng());
+        let keypair_b = Keypair::from_seckey_slice(&secp, sk_b.as_ref()).unwrap();
+        let (pk_b, _) = XOnlyPublicKey::from_keypair(&keypair_b);
+
+        // Sign with keypair_a, verify with keypair_b — should fail
+        let message = "dana-register:testnonce:testuser:testdomain.com";
+        let mut hasher = Sha256::new();
+        hasher.update(message.as_bytes());
+        let digest = hasher.finalize();
+        let msg = secp256k1::Message::from_digest_slice(&digest).unwrap();
+
+        let sig = secp.sign_schnorr_with_rng(&msg, &keypair_a, &mut rand::thread_rng());
+        assert!(secp.verify_schnorr(&sig, &msg, &pk_b).is_err());
+    }
+
+    #[test]
+    fn test_validate_dns_name() {
+        assert!(validate_dns_name("alice"));
+        assert!(validate_dns_name("alice-123"));
+        assert!(validate_dns_name("a")); // min 1 char
+        assert!(!validate_dns_name("")); // empty
+        assert!(!validate_dns_name("alice bob")); // space
+        assert!(!validate_dns_name("alice@domain")); // @
+        assert!(!validate_dns_name(&"a".repeat(64))); // max 63
+        assert!(validate_dns_name(&"a".repeat(63))); // exactly 63
+    }
+
+    #[test]
+    fn test_nonce_expiry() {
+        let expired = NonceEntry {
+            user_name: "test".into(),
+            sp_address: "sp1test".into(),
+            domain: "test.com".into(),
+            expires_at: Instant::now() - Duration::from_secs(1),
+        };
+        assert!(expired.is_expired());
+
+        let fresh = NonceEntry {
+            user_name: "test".into(),
+            sp_address: "sp1test".into(),
+            domain: "test.com".into(),
+            expires_at: Instant::now() + Duration::from_secs(300),
+        };
+        assert!(!fresh.is_expired());
     }
     // --- Cloudflare API helper tests against a local mock server ---
     // These exercise create_txt_record / list_bitcoin_records without needing a
