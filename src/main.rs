@@ -8,12 +8,12 @@ use axum::{
     response::Json as AxumJson,
     routing::{get, post},
 };
-use bitcoin_payment_instructions::{
-    Network, PaymentInstructions, PaymentMethod, amount::Amount, dns_resolver::DNSHrnResolver,
-};
+use spdk_wallet::bip321::Bip321Uri;
+use spdk_wallet::client::{parse_sp, parse_tsp, SpUriExtension};
 use log::{debug, error, info, warn};
 use reqwest::Client;
-use silentpayments::{Network as SpNetwork, SilentPaymentAddress};
+use silentpayments::{Network as SpNetwork, SilentPaymentAddressDisplay};
+use dnssec_prover::{query::build_txt_proof_async, rr::{Name, RR}, ser::parse_rr_stream, validation::verify_rr_stream};
 use std::collections::HashMap;
 use std::{net::SocketAddr, str::FromStr, sync::Arc};
 use tokio::sync::RwLock;
@@ -23,16 +23,16 @@ use crate::api_structs::{
     PrefixSearchRequest, PrefixSearchResponse, Record, RegisterRequest, RegisterResponse,
 };
 
+
 const CLOUDFLARE_API_BASE_URL: &str = "https://api.cloudflare.com/client/v4";
-const CLOUDFLARE_DNS_RESOLVER_IP: &str = "1.1.1.1:53";
 
 #[derive(Clone)]
 struct AppState {
     zone_id: String,
     api_token: String,
     domain: String,
-    sp_to_dana: Arc<RwLock<HashMap<SilentPaymentAddress, Vec<String>>>>,
-    dana_to_sp: Arc<RwLock<HashMap<String, SilentPaymentAddress>>>,
+    sp_to_dana: Arc<RwLock<HashMap<SilentPaymentAddressDisplay, Vec<String>>>>,
+    dana_to_sp: Arc<RwLock<HashMap<String, SilentPaymentAddressDisplay>>>,
     // we only accept registration requests from this network
     network: SpNetwork,
 }
@@ -49,93 +49,72 @@ async fn handle_get_info(
     )
 }
 
+static DNS_RESOLVER_ADDR: SocketAddr = std::net::SocketAddr::V4(std::net::SocketAddrV4::new(std::net::Ipv4Addr::new(1, 1, 1, 1), 53));
+
+fn has_bitcoin_prefix(data: &[u8]) -> bool {
+    data.starts_with(b"bitcoin:")
+}
+
 async fn fetch_sp_address_from_txt_record(
     user_name: &str,
     domain: &str,
     network: SpNetwork,
-) -> Result<Option<SilentPaymentAddress>> {
-    debug!(
-        "Checking if TXT record exists for user {} on domain {} and network {:?}",
-        user_name, domain, network
-    );
-    // Let's not allow regtest address is doesn't make much sense anyway
-    let core_network = match network {
-        SpNetwork::Mainnet => Network::Bitcoin,
-        SpNetwork::Testnet => Network::Testnet,
-        SpNetwork::Regtest => return Err(anyhow::anyhow!("Don't allow for regtest address")),
+) -> Result<Option<SilentPaymentAddressDisplay>> {
+    let dns_name = Name::try_from(format!("{}.user._bitcoin-payment.{}.", user_name, domain))
+        .map_err(|_| anyhow::anyhow!("The provided HRN was too long to fit in a DNS name"))?;
+
+    let proof = build_txt_proof_async(DNS_RESOLVER_ADDR, &dns_name)
+        .await
+        .map_err(|_| anyhow::anyhow!("DNS query for the HRN failed"))?;
+    let rrs = parse_rr_stream(&proof.0).map_err(|_| anyhow::anyhow!("DNS proof could not be parsed"))?;
+    let verified_rrs = verify_rr_stream(&rrs).map_err(|_| anyhow::anyhow!("DNSSEC validation failed"))?;
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .map_err(|_| anyhow::anyhow!("DNSSEC validation relies on a correct system clock"))?
+        .as_secs();
+    if now < verified_rrs.valid_from {
+        return Err(anyhow::anyhow!("Some DNSSEC records are not yet valid. Check your system clock."));
+    }
+    if now > verified_rrs.expires {
+        return Err(anyhow::anyhow!("Some DNSSEC records have expired. Check your system clock."));
+    }
+
+    let resolved_rrs = verified_rrs.resolve_name(&dns_name);
+
+    let mut result: Option<Vec<u8>> = None;
+    for rr in resolved_rrs {
+        if let RR::Txt(txt) = rr {
+            let data = txt.data.as_vec();
+            if has_bitcoin_prefix(&data) {
+                if result.is_some() {
+                    return Err(anyhow::anyhow!(
+                        "Multiple TXT records existed for the HRN, which is invalid"
+                    ));
+                }
+                result = Some(data);
+            }
+        }
+    }
+    let res = match result {
+        Some(data) => data,
+        None => return Ok(None),
     };
-    // Basically silent payments doesn't make the distinction between different testnet
-    let dns_resolver = DNSHrnResolver(SocketAddr::from_str(CLOUDFLARE_DNS_RESOLVER_IP).unwrap());
-    let payment_instructions = match PaymentInstructions::parse(
-        format!("{}@{}", user_name, domain).as_str(),
-        core_network,
-        &dns_resolver,
-        true,
-    )
-    .await
-    {
-        Ok(instructions) => instructions,
-        Err(e) => {
-            if format!("{:?}", e).contains("Multiple TXT records") {
-                warn!(
-                    "Multiple TXT records found for {}@{}. This should have been cleaned up before DNS query.",
-                    user_name, domain
-                );
-                return Err(anyhow::anyhow!(
-                    "Multiple TXT records exist for {}@{}, which is invalid. Please clean up duplicate records.",
-                    user_name,
-                    domain
-                ));
-            } else {
-                error!("Error parsing payment instructions: {:?}", e);
-                match e {
-                    bitcoin_payment_instructions::ParseError::HrnResolutionError(_) => {
-                        return Ok(None);
-                    } // We can't find a record for this user name
-                    _ => {
-                        return Err(anyhow::anyhow!(
-                            "Error parsing payment instructions: {:?}",
-                            e
-                        ));
-                    }
-                }
-            }
-        }
-    };
-    match payment_instructions {
-        PaymentInstructions::ConfigurableAmount(instructions) => {
-            // The resolver is pretty much useless here since we're only interested in silent payment
-            let hrn_resolver = DNSHrnResolver(dns_resolver.0);
-            let dummy_amount = Amount::from_sats(10_000).unwrap(); // Just defining something unlikely to fail in case there's a lnurl in the same entry
-            let fixed_amt_instructions =
-                match instructions.set_amount(dummy_amount, &hrn_resolver).await {
-                    Ok(instructions) => instructions,
-                    Err(e) => return Err(anyhow::anyhow!("Error setting amount: {:?}", e)),
-                };
-            for method in fixed_amt_instructions.methods().iter() {
-                match method {
-                    PaymentMethod::SilentPayment(sp_address) => {
-                        return Ok(Some(*sp_address));
-                    }
-                    _ => continue,
-                }
-            }
-        }
-        PaymentInstructions::FixedAmount(instructions) => {
-            for method in instructions.methods().iter() {
-                match method {
-                    PaymentMethod::SilentPayment(sp_address) => {
-                        return Ok(Some(*sp_address));
-                    }
-                    _ => continue,
-                }
-            }
-        }
+    let uri_string = std::str::from_utf8(&res)
+        .map_err(|_| anyhow::anyhow!("TXT record contained invalid UTF-8"))?;
+
+    let uri = Bip321Uri::<SpUriExtension>::from_str(uri_string)
+        .map_err(|_| anyhow::anyhow!("TXT record contained an invalid BIP-321 URI"))?;
+
+    let addrs = match network {
+        SpNetwork::Mainnet => parse_sp(uri.sp())
+            .map_err(|_| anyhow::anyhow!("Failed to parse mainnet silent payment address"))?,
+        _ => parse_tsp(uri.extensions().tsp())
+            .map_err(|_| anyhow::anyhow!("Failed to parse testnet silent payment address"))?,
     };
 
-    Ok(None)
+    Ok(addrs.first().cloned())
 }
-
 async fn create_txt_record(
     client: &Client,
     zone_id: &str,
@@ -251,7 +230,7 @@ async fn handle_register(
 
     // Validate SP address
     let sp_address =
-        match silentpayments::SilentPaymentAddress::try_from(request.sp_address.clone()) {
+        match silentpayments::SilentPaymentAddressDisplay::try_from(request.sp_address.clone()) {
             Ok(sp_address) => {
                 debug!("Valid SP address: {}", sp_address);
                 sp_address
@@ -271,14 +250,14 @@ async fn handle_register(
             }
         };
 
-    if sp_address.get_network() != state.network {
+    if sp_address.network() != state.network {
         return (
             StatusCode::BAD_REQUEST,
             AxumJson(RegisterResponse {
                 id: request.id,
                 message: format!(
                     "Registered address has wrong network type: {:?}, expected: {:?}",
-                    sp_address.get_network(),
+                    sp_address.network(),
                     state.network
                 ),
                 dana_address: None,
@@ -289,7 +268,7 @@ async fn handle_register(
     }
 
     // We modify the key depending on the network we're on (mainnet vs signet/testnet)
-    let network_key = match sp_address.get_network() {
+    let network_key = match sp_address.network() {
         SpNetwork::Mainnet => "sp",
         SpNetwork::Testnet => "tsp",
         SpNetwork::Regtest => {
@@ -327,10 +306,10 @@ async fn handle_register(
 
     let dana_address = format!("{}@{}", user_name, state.domain);
     let txt_name = format!("{}.user._bitcoin-payment.{}", user_name, state.domain);
-    let txt_content = format!("bitcoin:?{}={}", network_key, sp_address.to_string());
+    let txt_content = format!("bitcoin:?{}={}", network_key, sp_address);
 
     // First check if the record already exists using DNS-over-HTTPS
-    match fetch_sp_address_from_txt_record(&user_name, &state.domain, sp_address.get_network())
+    match fetch_sp_address_from_txt_record(&user_name, &state.domain, sp_address.network())
         .await
     {
         Ok(Some(registered_sp_address)) => {
@@ -375,7 +354,7 @@ async fn handle_register(
         }
         Ok(None) => debug!(
             "Didn't find a sp address for network {:?} and user name {}",
-            sp_address.get_network(),
+            sp_address.network(),
             user_name
         ),
         Err(e) => {
@@ -494,12 +473,12 @@ async fn handle_lookup_sp_address(
     );
 
     // Validate SP address
-    let sp_address = match SilentPaymentAddress::try_from(query.sp_address.clone()) {
+    let sp_address = match SilentPaymentAddressDisplay::try_from(query.sp_address.clone()) {
         Ok(sp_address) => {
             debug!(
                 "Successfully parsed SP address: {} (network: {:?})",
                 sp_address,
-                sp_address.get_network()
+                sp_address.network()
             );
             sp_address
         }
@@ -689,9 +668,9 @@ async fn main() {
         debug!("API Token: {}...", &api_token[..8.min(api_token.len())]);
     }
 
-    let sp_to_dana: Arc<RwLock<HashMap<SilentPaymentAddress, Vec<String>>>> =
+    let sp_to_dana: Arc<RwLock<HashMap<SilentPaymentAddressDisplay, Vec<String>>>> =
         Arc::new(RwLock::new(HashMap::new()));
-    let dana_to_sp: Arc<RwLock<HashMap<String, SilentPaymentAddress>>> =
+    let dana_to_sp: Arc<RwLock<HashMap<String, SilentPaymentAddressDisplay>>> =
         Arc::new(RwLock::new(HashMap::new()));
 
     // Populate the maps of sp addresses to dana addresses and vice versa on startup
@@ -746,7 +725,7 @@ async fn main() {
                         for param in sp_part.split('&') {
                             if let Some(sp_addr_str) = param.strip_prefix("sp=") {
                                 debug!("Found sp= parameter: {}", sp_addr_str);
-                                match SilentPaymentAddress::try_from(sp_addr_str.to_string()) {
+                                match SilentPaymentAddressDisplay::try_from(sp_addr_str.to_string()) {
                                     Ok(sp_address) => {
                                         let dana_addr = dana_address.clone();
                                         let existing =
@@ -756,7 +735,7 @@ async fn main() {
                                         info!(
                                             "Mapped SP address {} to Dana address {} (total mappings for this SP: {})",
                                             sp_addr_str,
-                                            &dana_address,
+                                            dana_address,
                                             existing.len()
                                         );
                                         processed_count += 1;
@@ -773,7 +752,7 @@ async fn main() {
                                 }
                             } else if let Some(sp_addr_str) = param.strip_prefix("tsp=") {
                                 debug!("Found tsp= parameter: {}", sp_addr_str);
-                                match SilentPaymentAddress::try_from(sp_addr_str.to_string()) {
+                                match SilentPaymentAddressDisplay::try_from(sp_addr_str.to_string()) {
                                     Ok(sp_address) => {
                                         let dana_addr = dana_address.clone();
                                         let existing =
@@ -783,7 +762,7 @@ async fn main() {
                                         info!(
                                             "Mapped SP address {} to Dana address {} (total mappings for this SP: {})",
                                             sp_addr_str,
-                                            &dana_address,
+                                            dana_address,
                                             existing.len()
                                         );
                                         processed_count += 1;
@@ -878,15 +857,15 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use silentpayments::SilentPaymentAddress;
+    use silentpayments::SilentPaymentAddressDisplay;
 
     #[tokio::test]
     async fn test_check_txt_record_exists_with_address() {
-        let address_to_register = SilentPaymentAddress::try_from("sp1qq0cygnetgn3rz2kla5cp05nj5uetlsrzez0l4p8g7wehf7ldr93lcqadw65upymwzvp5ed38l8ur2rznd6934xh95msevwrdwtrpk372hyz4vr6g").unwrap();
+        let address_to_register = SilentPaymentAddressDisplay::try_from("sp1qq0cygnetgn3rz2kla5cp05nj5uetlsrzez0l4p8g7wehf7ldr93lcqadw65upymwzvp5ed38l8ur2rznd6934xh95msevwrdwtrpk372hyz4vr6g").unwrap();
         let result = fetch_sp_address_from_txt_record(
             "donate",
             "danawallet.app",
-            address_to_register.get_network(),
+            address_to_register.network(),
         )
         .await;
 
@@ -900,9 +879,7 @@ mod tests {
         let result =
             fetch_sp_address_from_txt_record("invalid", "danawallet.app", SpNetwork::Mainnet).await;
 
-        assert!(result.is_ok());
-
-        assert_eq!(result.unwrap(), None);
+        assert!(result.is_err());
     }
 
     #[tokio::test]
