@@ -23,6 +23,10 @@ log = "0.4"
 env_logger = "0.10"
 silentpayments = "0.4.1"
 bitcoin-payment-instructions = { git="https://github.com/Sosthene00/bitcoin-payment-instructions.git", branch="add_silent_payments" }
+secp256k1 = { version = "0.28", features = ["rand", "std"] }
+hex = "0.4"
+rand = "0.8"
+sha2 = "0.10"
 
 [dev-dependencies]
 wiremock = "0.6"

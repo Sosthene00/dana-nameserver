@@ -8,6 +8,8 @@ pub struct RegisterRequest {
     pub domain: String,
     pub user_name: Option<String>,
     pub sp_address: String,
+    pub signature: String, // Schnorr signature hex
+    pub nonce: String,     // nonce from prepare
 }
 
 #[derive(Serialize)]
@@ -82,4 +84,21 @@ pub struct ApiResponse {
 pub struct GetInfoResponse {
     pub domain: String,
     pub network: Network,
+}
+
+// Register prepare endpoint types
+#[derive(Deserialize, Serialize)]
+pub struct RegisterPrepareRequest {
+    pub id: String,
+    pub domain: String,
+    pub user_name: Option<String>,
+    pub sp_address: String,
+}
+
+#[derive(Serialize)]
+pub struct RegisterPrepareResponse {
+    pub id: String,
+    pub message: String,
+    pub nonce: Option<String>,
+    pub error: Option<String>,
 }

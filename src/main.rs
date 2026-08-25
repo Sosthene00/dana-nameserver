@@ -12,15 +12,18 @@ use bitcoin_payment_instructions::{
     Network, PaymentInstructions, PaymentMethod, amount::Amount, dns_resolver::DNSHrnResolver,
 };
 use log::{debug, error, info, warn};
+use rand::RngCore;
 use reqwest::Client;
 use silentpayments::{Network as SpNetwork, SilentPaymentAddress};
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
 use std::{net::SocketAddr, str::FromStr, sync::Arc};
 use tokio::sync::RwLock;
 
 use crate::api_structs::{
     ApiResponse, CloudflareRequest, GetInfoResponse, LookupRequest, LookupResponse,
-    PrefixSearchRequest, PrefixSearchResponse, Record, RegisterRequest, RegisterResponse,
+    PrefixSearchRequest, PrefixSearchResponse, Record, RegisterPrepareRequest,
+    RegisterPrepareResponse, RegisterRequest, RegisterResponse,
 };
 
 const CLOUDFLARE_API_BASE_URL: &str = "https://api.cloudflare.com/client/v4";
@@ -33,6 +36,20 @@ fn cloudflare_base_url() -> String {
         .unwrap_or_else(|_| CLOUDFLARE_API_BASE_URL.to_string())
 }
 
+const NONCE_TTL_SECS: u64 = 300; // 5 minutes
+
+struct NonceEntry {
+    user_name: String,
+    sp_address: String,
+    domain: String,
+    expires_at: Instant,
+}
+
+impl NonceEntry {
+    fn is_expired(&self) -> bool {
+        Instant::now() > self.expires_at
+    }
+}
 
 #[derive(Clone)]
 struct AppState {
@@ -43,6 +60,8 @@ struct AppState {
     dana_to_sp: Arc<RwLock<HashMap<String, SilentPaymentAddress>>>,
     // we only accept registration requests from this network
     network: SpNetwork,
+    // Challenge-response nonce store for signature auth
+    nonce_store: Arc<RwLock<HashMap<String, NonceEntry>>>,
 }
 
 async fn handle_get_info(
@@ -224,6 +243,176 @@ async fn list_bitcoin_records(
     Ok(resp.result)
 }
 
+async fn cleanup_expired_nonces(nonce_store: &Arc<RwLock<HashMap<String, NonceEntry>>>) {
+    let mut store = nonce_store.write().await;
+    store.retain(|_, entry| !entry.is_expired());
+}
+
+/// Prepare a nonce for challenge-response registration authentication
+async fn handle_register_prepare(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<RegisterPrepareRequest>,
+) -> (StatusCode, AxumJson<RegisterPrepareResponse>) {
+    // Validate domain matches state domain
+    if request.domain != state.domain {
+        return (
+            StatusCode::BAD_REQUEST,
+            AxumJson(RegisterPrepareResponse {
+                id: request.id,
+                message: format!("Server registers for domain: {}", state.domain),
+                nonce: None,
+                error: None,
+            }),
+        );
+    }
+
+    // Validate user_name is present and non-empty
+    let user_name = match request.user_name {
+        Some(ref name) if !name.is_empty() => name.clone(),
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                AxumJson(RegisterPrepareResponse {
+                    id: request.id,
+                    message: "User name is required".to_string(),
+                    nonce: None,
+                    error: None,
+                }),
+            );
+        }
+    };
+
+    // Parse SP address
+    let sp_address = match SilentPaymentAddress::try_from(request.sp_address.clone()) {
+        Ok(sp_address) => {
+            debug!("Valid SP address: {}", sp_address);
+            sp_address
+        }
+        Err(e) => {
+            error!("Invalid SP address '{}': {}", request.sp_address, e);
+            return (
+                StatusCode::BAD_REQUEST,
+                AxumJson(RegisterPrepareResponse {
+                    id: request.id,
+                    message: format!("Invalid SP address: {}", e),
+                    nonce: None,
+                    error: None,
+                }),
+            );
+        }
+    };
+
+    // Validate SP address network matches state network
+    if sp_address.get_network() != state.network {
+        return (
+            StatusCode::BAD_REQUEST,
+            AxumJson(RegisterPrepareResponse {
+                id: request.id,
+                message: format!(
+                    "Registered address has wrong network type: {:?}, expected: {:?}",
+                    sp_address.get_network(),
+                    state.network
+                ),
+                nonce: None,
+                error: None,
+            }),
+        );
+    }
+
+    // Clean up expired nonces
+    cleanup_expired_nonces(&state.nonce_store).await;
+
+    // Generate a 32-byte random nonce
+    let mut nonce_bytes = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut nonce_bytes);
+    let nonce_hex = hex::encode(nonce_bytes);
+
+    // Store the nonce in the nonce store
+    let nonce_entry = NonceEntry {
+        user_name: user_name.clone(),
+        sp_address: sp_address.to_string(),
+        domain: state.domain.clone(),
+        expires_at: Instant::now() + Duration::from_secs(NONCE_TTL_SECS),
+    };
+
+    let mut store = state.nonce_store.write().await;
+    store.insert(nonce_hex.clone(), nonce_entry);
+    drop(store);
+
+    info!(
+        "Generated nonce for user {} on domain {} (expires in {}s)",
+        user_name, state.domain, NONCE_TTL_SECS
+    );
+
+    (
+        StatusCode::OK,
+        AxumJson(RegisterPrepareResponse {
+            id: request.id,
+            message: "Nonce generated successfully".to_string(),
+            nonce: Some(nonce_hex),
+            error: None,
+        }),
+    )
+}
+
+/// Validate that a string is a well-formed DNS label (RFC 1035).
+fn validate_dns_name(name: &str) -> bool {
+    if name.is_empty() || name.len() > 63 {
+        return false;
+    }
+    name.chars().all(|c| c.is_alphanumeric() || c == '-')
+}
+
+/// Verify a Schnorr signature over `message` using the spend public key
+/// derived from `sp_address`.
+///
+/// The message is SHA-256 hashed before verification, as required by
+/// the secp256k1 Schnorr signature scheme.
+fn verify_schnorr_signature(
+    signature_hex: &str,
+    message: &str,
+    sp_address: &SilentPaymentAddress,
+) -> Result<(), String> {
+    use secp256k1::{Message, Secp256k1, XOnlyPublicKey, schnorr::Signature};
+    use sha2::{Digest, Sha256};
+
+    // Decode hex signature
+    let sig_bytes =
+        hex::decode(signature_hex).map_err(|e| format!("Invalid signature hex: {}", e))?;
+    if sig_bytes.len() != 64 {
+        return Err(format!(
+            "Signature must be 64 bytes (got {})",
+            sig_bytes.len()
+        ));
+    }
+
+    // Parse Schnorr signature (secp256k1 0.28: schnorr::Signature, not SchnorrSig)
+    let sig =
+        Signature::from_slice(&sig_bytes)
+            .map_err(|e| format!("Invalid signature encoding: {}", e))?;
+
+    // Get spend public key from SP address and convert to XOnlyPublicKey
+    // (Schnorr signatures use X-only point compression)
+    let spend_pubkey = sp_address.get_spend_key();
+    let pk_bytes = spend_pubkey.serialize();
+    let x_only_pubkey = XOnlyPublicKey::from_slice(&pk_bytes[1..])
+        .map_err(|e| format!("Invalid X-only pubkey: {}", e))?;
+
+    // SHA-256 hash the message
+    let mut hasher = Sha256::new();
+    hasher.update(message.as_bytes());
+    let digest = hasher.finalize();
+
+    // Create message from digest
+    let msg = Message::from_digest_slice(&digest)
+        .map_err(|e| format!("Invalid digest: {}", e))?;
+
+    // Verify
+    let secp = Secp256k1::new();
+    secp.verify_schnorr(&sig, &msg, &x_only_pubkey)
+        .map_err(|e| format!("Signature verification failed: {}", e))
+}
+
 async fn handle_register(
     State(state): State<Arc<AppState>>,
     Json(request): Json<RegisterRequest>,
@@ -314,11 +503,9 @@ async fn handle_register(
         }
     };
 
-    // TODO verify a signature over some message that user must provides with the request
-
-    // if user_name is empty, we generate a random one
+    // Extract user_name before validation (nonce may store None)
     let user_name = match request.user_name {
-        Some(user_name) => user_name,
+        Some(name) => name,
         None => {
             return (
                 StatusCode::BAD_REQUEST,
@@ -332,6 +519,90 @@ async fn handle_register(
             );
         }
     };
+
+    // Validate nonce exists in store, matches request data, and hasn't expired
+    {
+        let store = state.nonce_store.read().await;
+        match store.get(&request.nonce) {
+            Some(entry) => {
+                if entry.is_expired() {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        AxumJson(RegisterResponse {
+                            id: request.id,
+                            message: "Registration nonce expired. Please request a new one.".to_string(),
+                            dana_address: None,
+                            sp_address: None,
+                            dns_record_id: None,
+                        }),
+                    );
+                }
+                // Validate nonce's stored data matches the request
+                if entry.user_name != user_name || entry.sp_address != request.sp_address || entry.domain != request.domain {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        AxumJson(RegisterResponse {
+                            id: request.id,
+                            message: "Nonce does not match this registration request. Request a new one.".to_string(),
+                            dana_address: None,
+                            sp_address: None,
+                            dns_record_id: None,
+                        }),
+                    );
+                }
+            }
+            None => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    AxumJson(RegisterResponse {
+                        id: request.id,
+                        message: "Invalid or missing nonce. Please call /register/prepare first.".to_string(),
+                        dana_address: None,
+                        sp_address: None,
+                        dns_record_id: None,
+                    }),
+                );
+            }
+        }
+    }
+
+    // Invalidate nonce (one-time use)
+    {
+        let mut store = state.nonce_store.write().await;
+        store.remove(&request.nonce);
+    }
+
+    // Verify signature over the nonce + user_name + domain
+    let signed_message = format!("dana-register:{}:{}:{}", request.nonce, user_name, state.domain);
+    
+    if let Err(e) = verify_schnorr_signature(&request.signature, &signed_message, &sp_address) {
+        warn!("Signature verification failed for user '{}': {}", user_name, e);
+        return (
+            StatusCode::BAD_REQUEST,
+            AxumJson(RegisterResponse {
+                id: request.id,
+                message: format!("Invalid signature: {}", e),
+                dana_address: None,
+                sp_address: None,
+                dns_record_id: None,
+            }),
+        );
+    }
+    debug!("Signature verified for user '{}'", user_name);
+
+    // Validate DNS name before creating records
+    if !validate_dns_name(&user_name) {
+        return (
+            StatusCode::BAD_REQUEST,
+            AxumJson(RegisterResponse {
+                id: request.id,
+                message: "Invalid user name (alphanumeric and hyphens only, 1-63 chars)".to_string(),
+                dana_address: None,
+                sp_address: None,
+                dns_record_id: None,
+            }),
+        );
+    }
 
     let dana_address = format!("{}@{}", user_name, state.domain);
     let txt_name = format!("{}.user._bitcoin-payment.{}", user_name, state.domain);
@@ -701,6 +972,8 @@ async fn main() {
         Arc::new(RwLock::new(HashMap::new()));
     let dana_to_sp: Arc<RwLock<HashMap<String, SilentPaymentAddress>>> =
         Arc::new(RwLock::new(HashMap::new()));
+    let nonce_store: Arc<RwLock<HashMap<String, NonceEntry>>> =
+        Arc::new(RwLock::new(HashMap::new()));
 
     // Populate the maps of sp addresses to dana addresses and vice versa on startup
     info!("Populating SP address to Dana address maps from Cloudflare records...");
@@ -856,11 +1129,13 @@ async fn main() {
         sp_to_dana,
         dana_to_sp,
         network,
+        nonce_store,
     });
 
     let v1_router = Router::new()
         .route("/info", get(handle_get_info))
         .route("/register", post(handle_register))
+        .route("/register/prepare", post(handle_register_prepare))
         .route("/lookup", get(handle_lookup_sp_address))
         .route("/search", get(handle_prefix_search));
 
