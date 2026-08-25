@@ -101,5 +101,4 @@ pub struct RegisterPrepareResponse {
     pub id: String,
     pub message: String,
     pub nonce: Option<String>,
-    pub error: Option<String>,
 }

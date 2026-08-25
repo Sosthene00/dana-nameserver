@@ -34,7 +34,6 @@ const NONCE_TTL_SECS: u64 = 300; // 5 minutes
 struct NonceEntry {
     user_name: String,
     sp_address: String,
-    domain: String,
     expires_at: Instant,
 }
 
@@ -259,7 +258,6 @@ async fn handle_register_prepare(
                 id: request.id,
                 message: format!("Server registers for domain: {}", state.domain),
                 nonce: None,
-                error: None,
             }),
         );
     }
@@ -274,7 +272,6 @@ async fn handle_register_prepare(
                     id: request.id,
                     message: "User name is required".to_string(),
                     nonce: None,
-                    error: None,
                 }),
             );
         }
@@ -289,7 +286,6 @@ async fn handle_register_prepare(
                     "Invalid user name: must be ASCII alphanumeric and hyphens only, 1-63 chars"
                         .to_string(),
                 nonce: None,
-                error: None,
             }),
         );
     }
@@ -308,7 +304,6 @@ async fn handle_register_prepare(
                     id: request.id,
                     message: format!("Invalid SP address: {}", e),
                     nonce: None,
-                    error: None,
                 }),
             );
         }
@@ -326,13 +321,10 @@ async fn handle_register_prepare(
                     state.network
                 ),
                 nonce: None,
-                error: None,
             }),
         );
     }
 
-    // Clean up expired nonces
-    cleanup_expired_nonces(&state.nonce_store).await;
 
     // Generate a 32-byte random nonce
     let mut nonce_bytes = [0u8; 32];
@@ -343,7 +335,6 @@ async fn handle_register_prepare(
     let nonce_entry = NonceEntry {
         user_name: user_name.clone(),
         sp_address: sp_address.to_string(),
-        domain: state.domain.clone(),
         expires_at: Instant::now() + Duration::from_secs(NONCE_TTL_SECS),
     };
 
@@ -362,7 +353,6 @@ async fn handle_register_prepare(
             id: request.id,
             message: "Nonce generated successfully".to_string(),
             nonce: Some(nonce_hex),
-            error: None,
         }),
     )
 }
@@ -432,7 +422,6 @@ async fn claim_nonce(
     nonce: &str,
     user_name: &str,
     sp_address: &str,
-    domain: &str,
 ) -> Result<(), String> {
     let mut store = nonce_store.write().await;
     // Validate while holding the write lock; if claimable, remove it atomically.
@@ -442,7 +431,6 @@ async fn claim_nonce(
             !e.is_expired()
                 && e.user_name == user_name
                 && e.sp_address == sp_address
-                && e.domain == domain
         }
     };
     if !claimable {
@@ -583,7 +571,6 @@ async fn handle_register(
         &request.nonce,
         &user_name,
         &request.sp_address,
-        &request.domain,
     )
     .await
     {
@@ -623,20 +610,6 @@ async fn handle_register(
     }
     debug!("Signature verified for user '{}'", user_name);
 
-    // Validate DNS name before creating records
-    if !validate_dns_name(&user_name) {
-        return (
-            StatusCode::BAD_REQUEST,
-            AxumJson(RegisterResponse {
-                id: request.id,
-                message: "Invalid user name (alphanumeric and hyphens only, 1-63 chars)"
-                    .to_string(),
-                dana_address: None,
-                sp_address: None,
-                dns_record_id: None,
-            }),
-        );
-    }
 
     let dana_address = format!("{}@{}", user_name, state.domain);
     let txt_name = format!("{}.user._bitcoin-payment.{}", user_name, state.domain);
