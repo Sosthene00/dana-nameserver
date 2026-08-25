@@ -62,9 +62,9 @@ struct AppState {
     network: SpNetwork,
     // Challenge-response nonce store for signature auth
     nonce_store: Arc<RwLock<HashMap<String, NonceEntry>>>,
-    // Per-username mutexes so check-and-create for the same name is serialized,
-    // closing the TOCTOU window between the DNS exists-check and TXT creation.
-    username_locks: Arc<std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
+    // Serializes DNS exists-check + TXT creation so concurrent registrations
+    // cannot both see "absent" and both create a record (MODERATE-5).
+    register_create_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 async fn handle_get_info(
@@ -473,20 +473,6 @@ async fn claim_nonce(
     Ok(())
 }
 
-/// Get (or create) the per-username lock for `user_name`. The caller holds it
-/// across the DNS exists-check and TXT creation so concurrent registrations for
-/// the same name cannot both see "absent" and both create the record (MODERATE-5).
-fn get_username_lock(state: &AppState, user_name: &str) -> Arc<tokio::sync::Mutex<()>> {
-    let mut locks = state
-        .username_locks
-        .lock()
-        .expect("username_locks mutex poisoned");
-    locks
-        .entry(user_name.to_string())
-        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-        .clone()
-}
-
 async fn handle_register(
     State(state): State<Arc<AppState>>,
     Json(request): Json<RegisterRequest>,
@@ -663,10 +649,7 @@ async fn handle_register(
     let txt_name = format!("{}.user._bitcoin-payment.{}", user_name, state.domain);
     let txt_content = format!("bitcoin:?{}={}", network_key, sp_address.to_string());
 
-    // Serialize check-and-create for the same user name: without this, two
-    // concurrent registrations can both see "no TXT exists" and both create one.
-    let username_lock = get_username_lock(&state, &user_name);
-    let _username_guard = username_lock.lock().await;
+    let _create_guard = state.register_create_lock.lock().await;
 
     // First check if the record already exists using DNS-over-HTTPS
     match fetch_sp_address_from_txt_record(&user_name, &state.domain, sp_address.get_network())
@@ -1192,7 +1175,7 @@ async fn main() {
         dana_to_sp,
         network,
         nonce_store,
-        username_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+        register_create_lock: Arc::new(tokio::sync::Mutex::new(())),
     });
 
     let v1_router = Router::new()
@@ -1576,34 +1559,4 @@ async fn test_nonce_claim_rejects_mismatch_and_expired() {
     let expired = super::claim_nonce(&store, "n2", "alice", "sp1alice", "test.com").await;
     assert!(expired.is_err());
 }
-
-    #[tokio::test]
-    async fn test_username_lock_serializes_same_name() {
-        let state = AppState {
-            zone_id: "zone".into(),
-            api_token: "token".into(),
-            domain: "test.com".into(),
-            sp_to_dana: Arc::new(RwLock::new(HashMap::new())),
-            dana_to_sp: Arc::new(RwLock::new(HashMap::new())),
-            network: SpNetwork::Mainnet,
-            nonce_store: Arc::new(RwLock::new(HashMap::new())),
-            username_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
-        };
-
-        // Same user name => the same underlying lock, so check-and-create is serialized.
-        let l1 = get_username_lock(&state, "alice");
-        let l2 = get_username_lock(&state, "alice");
-        assert!(Arc::ptr_eq(&l1, &l2));
-
-        // Different user names => independent locks (no cross-user serialization).
-        let lbob = get_username_lock(&state, "bob");
-        assert!(!Arc::ptr_eq(&l1, &lbob));
-
-        // The lock actually blocks a concurrent acquire for the same name (TOCTOU fix).
-        let binding = l1.clone();
-        let _g1 = binding.lock().await;
-        assert!(l2.try_lock().is_err());
-        drop(_g1);
-        assert!(l2.try_lock().is_ok());
-    }
 }
