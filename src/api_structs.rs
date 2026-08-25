@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use silentpayments::Network;
+use silentpayments::Network as SpNetwork;
 
 // Register endpoint types
 #[derive(Deserialize, Serialize)]
@@ -64,6 +64,7 @@ pub struct Record {
     #[allow(unused)]
     pub id: String,
     pub name: String,
+    #[allow(unused)]
     #[serde(rename = "type")]
     pub record_type: String,
     pub content: String,
@@ -81,5 +82,18 @@ pub struct ApiResponse {
 #[derive(Serialize)]
 pub struct GetInfoResponse {
     pub domain: String,
-    pub network: Network,
+    #[serde(serialize_with = "serialize_sp_network")]
+    pub network: SpNetwork,
+}
+
+fn serialize_sp_network<S>(net: &SpNetwork, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    let name = match net {
+        SpNetwork::Mainnet => "mainnet",
+        SpNetwork::Testnet => "testnet",
+        SpNetwork::Regtest => "regtest",
+    };
+    serializer.serialize_str(name)
 }
