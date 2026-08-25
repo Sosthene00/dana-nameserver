@@ -432,15 +432,15 @@ fn verify_schnorr_signature(
 
 /// Atomically claim a registration nonce so two concurrent requests with the
 /// same nonce cannot both proceed. Removes the nonce from the store under a
-/// write lock; the caller owns the entry and must call `restore_nonce` if the
-/// registration attempt ultimately fails.
+/// write lock; the nonce is single-use — on any later failure the client must
+/// call `/register/prepare` again.
 async fn claim_nonce(
     nonce_store: &Arc<RwLock<HashMap<String, NonceEntry>>>,
     nonce: &str,
     user_name: &str,
     sp_address: &str,
     domain: &str,
-) -> Result<NonceEntry, String> {
+) -> Result<(), String> {
     let mut store = nonce_store.write().await;
     // Validate while holding the write lock; if claimable, remove it atomically.
     let claimable = match store.get(nonce) {
@@ -469,17 +469,8 @@ async fn claim_nonce(
             }
         };
     }
-    Ok(store.remove(nonce).expect("validated nonce is present"))
-}
-
-/// Restore a claimed nonce after a failed registration attempt so the client
-/// can retry with the same nonce. It remains single-use only on success.
-async fn restore_nonce(
-    nonce_store: &Arc<RwLock<HashMap<String, NonceEntry>>>,
-    nonce: &str,
-    entry: NonceEntry,
-) {
-    nonce_store.write().await.insert(nonce.to_string(), entry);
+    store.remove(nonce).expect("validated nonce is present");
+    Ok(())
 }
 
 /// Get (or create) the per-username lock for `user_name`. The caller holds it
@@ -606,9 +597,9 @@ async fn handle_register(
     };
 
     // Atomically claim the nonce so concurrent requests with the same nonce
-    // cannot both proceed. On any failure after this point the nonce is
-    // restored so the client can retry.
-    let claimed_nonce = match claim_nonce(
+    // cannot both proceed. Claim consumes it; on any later failure the client
+    // must call /register/prepare again.
+    if let Err(msg) = claim_nonce(
         &state.nonce_store,
         &request.nonce,
         &user_name,
@@ -617,20 +608,17 @@ async fn handle_register(
     )
     .await
     {
-        Ok(entry) => entry,
-        Err(msg) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                AxumJson(RegisterResponse {
-                    id: request.id,
-                    message: msg,
-                    dana_address: None,
-                    sp_address: None,
-                    dns_record_id: None,
-                }),
-            );
-        }
-    };
+        return (
+            StatusCode::BAD_REQUEST,
+            AxumJson(RegisterResponse {
+                id: request.id,
+                message: msg,
+                dana_address: None,
+                sp_address: None,
+                dns_record_id: None,
+            }),
+        );
+    }
 
     // Verify signature over the nonce + user_name + domain
     let signed_message = format!(
@@ -639,7 +627,6 @@ async fn handle_register(
     );
 
     if let Err(e) = verify_schnorr_signature(&request.signature, &signed_message, &sp_address) {
-            restore_nonce(&state.nonce_store, &request.nonce, claimed_nonce).await;
         warn!(
             "Signature verification failed for user '{}': {}",
             user_name, e
@@ -659,7 +646,6 @@ async fn handle_register(
 
     // Validate DNS name before creating records
     if !validate_dns_name(&user_name) {
-            restore_nonce(&state.nonce_store, &request.nonce, claimed_nonce).await;
         return (
             StatusCode::BAD_REQUEST,
             AxumJson(RegisterResponse {
@@ -716,7 +702,6 @@ async fn handle_register(
                 );
             }
             error!("TXT record already exists for user name: {}", user_name);
-            restore_nonce(&state.nonce_store, &request.nonce, claimed_nonce).await;
             return (
                 StatusCode::CONFLICT,
                 AxumJson(RegisterResponse {
@@ -734,7 +719,6 @@ async fn handle_register(
             user_name
         ),
         Err(e) => {
-            restore_nonce(&state.nonce_store, &request.nonce, claimed_nonce).await;
             error!(
                 "Error checking for existing TXT record for user name {}: {}",
                 user_name, e
@@ -791,7 +775,6 @@ async fn handle_register(
             Some(id)
         }
         Ok(None) => {
-            restore_nonce(&state.nonce_store, &request.nonce, claimed_nonce).await;
             warn!(
                 "Failed to create TXT record: No ID returned from Cloudflare for {}",
                 txt_name
@@ -809,7 +792,6 @@ async fn handle_register(
             );
         }
         Err(e) => {
-            restore_nonce(&state.nonce_store, &request.nonce, claimed_nonce).await;
             error!("Error creating TXT record {}: {}", txt_name, e);
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -1537,7 +1519,7 @@ async fn test_nonce_claim_is_atomic() {
 }
 
 #[tokio::test]
-async fn test_nonce_restore_allows_retry() {
+async fn test_nonce_claim_is_single_use() {
     let store = std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
     store.write().await.insert(
         "n1".to_string(),
@@ -1549,15 +1531,15 @@ async fn test_nonce_restore_allows_retry() {
         },
     );
 
-    let claimed = super::claim_nonce(&store, "n1", "alice", "sp1alice", "test.com")
-        .await
-        .unwrap();
+    assert!(
+        super::claim_nonce(&store, "n1", "alice", "sp1alice", "test.com")
+            .await
+            .is_ok()
+    );
 
-    // A failed registration attempt restores the nonce for a retry.
-    super::restore_nonce(&store, "n1", claimed).await;
-
+    // Claim removes the nonce; a retry must go through /register/prepare again.
     let retry = super::claim_nonce(&store, "n1", "alice", "sp1alice", "test.com").await;
-    assert!(retry.is_ok());
+    assert!(retry.is_err());
 }
 
 #[tokio::test]
