@@ -26,6 +26,14 @@ use crate::api_structs::{
 const CLOUDFLARE_API_BASE_URL: &str = "https://api.cloudflare.com/client/v4";
 const CLOUDFLARE_DNS_RESOLVER_IP: &str = "1.1.1.1:53";
 
+/// Base URL for the Cloudflare API. Defaults to the real API; override with the
+/// `CLOUDFLARE_API_BASE_URL` env var to point at a local mock server for testing.
+fn cloudflare_base_url() -> String {
+    std::env::var("CLOUDFLARE_API_BASE_URL")
+        .unwrap_or_else(|_| CLOUDFLARE_API_BASE_URL.to_string())
+}
+
+
 #[derive(Clone)]
 struct AppState {
     zone_id: String,
@@ -143,7 +151,7 @@ async fn create_txt_record(
     name: &str,
     content: &str,
 ) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
-    let url = format!("{}/zones/{}/dns_records", CLOUDFLARE_API_BASE_URL, zone_id);
+    let url = format!("{}/zones/{}/dns_records", cloudflare_base_url(), zone_id);
 
     debug!("Creating TXT record: {} -> {}", name, content);
     debug!("Using Cloudflare API URL: {}", url);
@@ -187,7 +195,7 @@ async fn list_bitcoin_records(
     api_token: &str,
     domain: &str,
 ) -> Result<Vec<Record>, Box<dyn std::error::Error + Send + Sync>> {
-    let url = format!("{}/zones/{}/dns_records", CLOUDFLARE_API_BASE_URL, zone_id);
+    let url = format!("{}/zones/{}/dns_records", cloudflare_base_url(), zone_id);
     info!(
         "Listing Bitcoin TXT records from Cloudflare API URL: {}",
         url
@@ -879,6 +887,8 @@ async fn main() {
 mod tests {
     use super::*;
     use silentpayments::SilentPaymentAddress;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    use wiremock::matchers::{method, path, header, query_param};
 
     #[tokio::test]
     async fn test_check_txt_record_exists_with_address() {
@@ -930,4 +940,135 @@ mod tests {
 
         assert!(result.is_err());
     }
+    // --- Cloudflare API helper tests against a local mock server ---
+    // These exercise create_txt_record / list_bitcoin_records without needing a
+    // real Cloudflare API key: the base URL is pointed at a wiremock server via
+    // the CLOUDFLARE_API_BASE_URL env var. The env var is process-global, so
+    // these tests are serialized against each other with CF_ENV_LOCK.
+    static CF_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[tokio::test]
+    async fn test_create_txt_record_mock_success() {
+        let _guard = CF_ENV_LOCK.lock().unwrap();
+        let m = MockServer::start().await;
+        let zone = "testzone123";
+        let token = "test-token";
+
+        Mock::given(method("POST"))
+            .and(path(format!("/zones/{}/dns_records", zone)))
+            .and(header("Authorization", format!("Bearer {}", token)))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(&serde_json::json!({
+                    "success": true,
+                    "result": { "id": "rec-abc-123" },
+                })),
+            )
+            .expect(1)
+            .mount(&m)
+            .await;
+
+        unsafe { std::env::set_var("CLOUDFLARE_API_BASE_URL", m.uri()) };
+        let client = Client::new();
+        let got = create_txt_record(
+            &client,
+            zone,
+            token,
+            "user._bitcoin-payment.example.com",
+            "bitcoin:sp1qq...",
+        )
+        .await
+        .unwrap();
+        unsafe { std::env::remove_var("CLOUDFLARE_API_BASE_URL") };
+
+        assert_eq!(got, Some("rec-abc-123".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_create_txt_record_mock_no_id() {
+        let _guard = CF_ENV_LOCK.lock().unwrap();
+        let m = MockServer::start().await;
+        let zone = "testzone456";
+        let token = "test-token2";
+
+        Mock::given(method("POST"))
+            .and(path(format!("/zones/{}/dns_records", zone)))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(&serde_json::json!({
+                    "success": true,
+                    "result": {},
+                })),
+            )
+            .expect(1)
+            .mount(&m)
+            .await;
+
+        unsafe { std::env::set_var("CLOUDFLARE_API_BASE_URL", m.uri()) };
+        let client = Client::new();
+        let got = create_txt_record(&client, zone, token, "a", "b").await.unwrap();
+        unsafe { std::env::remove_var("CLOUDFLARE_API_BASE_URL") };
+
+        assert_eq!(got, None);
+    }
+
+    #[tokio::test]
+    async fn test_create_txt_record_mock_error_status() {
+        let _guard = CF_ENV_LOCK.lock().unwrap();
+        let m = MockServer::start().await;
+        let zone = "testzone789";
+        let token = "test-token3";
+
+        Mock::given(method("POST"))
+            .and(path(format!("/zones/{}/dns_records", zone)))
+            .respond_with(ResponseTemplate::new(400))
+            .expect(1)
+            .mount(&m)
+            .await;
+
+        unsafe { std::env::set_var("CLOUDFLARE_API_BASE_URL", m.uri()) };
+        let client = Client::new();
+        let got = create_txt_record(&client, zone, token, "a", "b").await.unwrap();
+        unsafe { std::env::remove_var("CLOUDFLARE_API_BASE_URL") };
+
+        assert_eq!(got, None);
+    }
+
+    #[tokio::test]
+    async fn test_list_bitcoin_records_mock() {
+        let _guard = CF_ENV_LOCK.lock().unwrap();
+        let m = MockServer::start().await;
+        let zone = "testzone000";
+        let token = "test-token4";
+        let domain = "example.com";
+        let suffix = format!("user._bitcoin-payment.{}", domain);
+
+        Mock::given(method("GET"))
+            .and(path(format!("/zones/{}/dns_records", zone)))
+            .and(query_param("type", "TXT"))
+            .and(query_param("name.endswith", suffix.as_str()))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(&serde_json::json!({
+                    "success": true,
+                    "result": [{
+                        "id": "rec1",
+                        "name": "user._bitcoin-payment.example.com.",
+                        "type": "TXT",
+                        "content": "bitcoin:sp1qq..."
+                    }],
+                })),
+            )
+            .expect(1)
+            .mount(&m)
+            .await;
+
+        unsafe { std::env::set_var("CLOUDFLARE_API_BASE_URL", m.uri()) };
+        let got = list_bitcoin_records(zone, token, domain).await.unwrap();
+        unsafe { std::env::remove_var("CLOUDFLARE_API_BASE_URL") };
+
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].id, "rec1");
+        assert_eq!(got[0].name, "user._bitcoin-payment.example.com.");
+        assert_eq!(got[0].record_type, "TXT");
+        assert_eq!(got[0].content, "bitcoin:sp1qq...");
+    }
+
 }
