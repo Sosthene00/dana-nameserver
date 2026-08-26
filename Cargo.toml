@@ -24,3 +24,5 @@ env_logger = "0.10"
 dnssec-prover = { version = "0.6.8", features = ["tokio", "std"] }
 silentpayments = { git = "https://github.com/cygnet3/spdk", rev = "8dbf11b7c63a995ca34f699fd5056a587a6c7581", default-features = false, features = ["encode"] }
 spdk-wallet = { git = "https://github.com/cygnet3/spdk", rev = "8dbf11b7c63a995ca34f699fd5056a587a6c7581", package = "spdk-wallet", default-features = false }
+[dev-dependencies]
+wiremock = "0.6"
