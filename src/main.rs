@@ -12,15 +12,18 @@ use bitcoin_payment_instructions::{
     Network, PaymentInstructions, PaymentMethod, amount::Amount, dns_resolver::DNSHrnResolver,
 };
 use log::{debug, error, info, warn};
+use rand::RngCore;
 use reqwest::Client;
 use silentpayments::{Network as SpNetwork, SilentPaymentAddress};
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
 use std::{net::SocketAddr, str::FromStr, sync::Arc};
 use tokio::sync::RwLock;
 
 use crate::api_structs::{
     ApiResponse, CloudflareRequest, GetInfoResponse, LookupRequest, LookupResponse,
-    PrefixSearchRequest, PrefixSearchResponse, Record, RegisterRequest, RegisterResponse,
+    PrefixSearchRequest, PrefixSearchResponse, Record, RegisterPrepareRequest,
+    RegisterPrepareResponse, RegisterRequest, RegisterResponse,
 };
 
 const CLOUDFLARE_API_BASE_URL: &str = "https://api.cloudflare.com/client/v4";
@@ -33,6 +36,20 @@ fn cloudflare_base_url() -> String {
         .unwrap_or_else(|_| CLOUDFLARE_API_BASE_URL.to_string())
 }
 
+const NONCE_TTL_SECS: u64 = 300; // 5 minutes
+
+struct NonceEntry {
+    user_name: String,
+    sp_address: String,
+    domain: String,
+    expires_at: Instant,
+}
+
+impl NonceEntry {
+    fn is_expired(&self) -> bool {
+        Instant::now() > self.expires_at
+    }
+}
 
 #[derive(Clone)]
 struct AppState {
@@ -43,6 +60,11 @@ struct AppState {
     dana_to_sp: Arc<RwLock<HashMap<String, SilentPaymentAddress>>>,
     // we only accept registration requests from this network
     network: SpNetwork,
+    // Challenge-response nonce store for signature auth
+    nonce_store: Arc<RwLock<HashMap<String, NonceEntry>>>,
+    // Serializes DNS exists-check + TXT creation so concurrent registrations
+    // cannot both see "absent" and both create a record (MODERATE-5).
+    register_create_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 async fn handle_get_info(
@@ -224,10 +246,239 @@ async fn list_bitcoin_records(
     Ok(resp.result)
 }
 
+async fn cleanup_expired_nonces(nonce_store: &Arc<RwLock<HashMap<String, NonceEntry>>>) {
+    let mut store = nonce_store.write().await;
+    store.retain(|_, entry| !entry.is_expired());
+}
+
+/// Prepare a nonce for challenge-response registration authentication
+async fn handle_register_prepare(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<RegisterPrepareRequest>,
+) -> (StatusCode, AxumJson<RegisterPrepareResponse>) {
+    // Bound the in-memory nonce store by evicting expired entries
+    cleanup_expired_nonces(&state.nonce_store).await;
+    // Validate domain matches state domain
+    if request.domain != state.domain {
+        return (
+            StatusCode::BAD_REQUEST,
+            AxumJson(RegisterPrepareResponse {
+                id: request.id,
+                message: format!("Server registers for domain: {}", state.domain),
+                nonce: None,
+                error: None,
+            }),
+        );
+    }
+
+    // Validate user_name is present and non-empty
+    let user_name = match request.user_name {
+        Some(ref name) if !name.is_empty() => name.clone(),
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                AxumJson(RegisterPrepareResponse {
+                    id: request.id,
+                    message: "User name is required".to_string(),
+                    nonce: None,
+                    error: None,
+                }),
+            );
+        }
+    };
+    // Reject DNS-invalid user names before issuing a nonce (RFC 1035: ASCII alphanumeric + hyphens, 1-63)
+    if !validate_dns_name(&user_name) {
+        return (
+            StatusCode::BAD_REQUEST,
+            AxumJson(RegisterPrepareResponse {
+                id: request.id,
+                message:
+                    "Invalid user name: must be ASCII alphanumeric and hyphens only, 1-63 chars"
+                        .to_string(),
+                nonce: None,
+                error: None,
+            }),
+        );
+    }
+
+    // Parse SP address
+    let sp_address = match SilentPaymentAddress::try_from(request.sp_address.clone()) {
+        Ok(sp_address) => {
+            debug!("Valid SP address: {}", sp_address);
+            sp_address
+        }
+        Err(e) => {
+            error!("Invalid SP address '{}': {}", request.sp_address, e);
+            return (
+                StatusCode::BAD_REQUEST,
+                AxumJson(RegisterPrepareResponse {
+                    id: request.id,
+                    message: format!("Invalid SP address: {}", e),
+                    nonce: None,
+                    error: None,
+                }),
+            );
+        }
+    };
+
+    // Validate SP address network matches state network
+    if sp_address.get_network() != state.network {
+        return (
+            StatusCode::BAD_REQUEST,
+            AxumJson(RegisterPrepareResponse {
+                id: request.id,
+                message: format!(
+                    "Registered address has wrong network type: {:?}, expected: {:?}",
+                    sp_address.get_network(),
+                    state.network
+                ),
+                nonce: None,
+                error: None,
+            }),
+        );
+    }
+
+    // Clean up expired nonces
+    cleanup_expired_nonces(&state.nonce_store).await;
+
+    // Generate a 32-byte random nonce
+    let mut nonce_bytes = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut nonce_bytes);
+    let nonce_hex = hex::encode(nonce_bytes);
+
+    // Store the nonce in the nonce store
+    let nonce_entry = NonceEntry {
+        user_name: user_name.clone(),
+        sp_address: sp_address.to_string(),
+        domain: state.domain.clone(),
+        expires_at: Instant::now() + Duration::from_secs(NONCE_TTL_SECS),
+    };
+
+    let mut store = state.nonce_store.write().await;
+    store.insert(nonce_hex.clone(), nonce_entry);
+    drop(store);
+
+    info!(
+        "Generated nonce for user {} on domain {} (expires in {}s)",
+        user_name, state.domain, NONCE_TTL_SECS
+    );
+
+    (
+        StatusCode::OK,
+        AxumJson(RegisterPrepareResponse {
+            id: request.id,
+            message: "Nonce generated successfully".to_string(),
+            nonce: Some(nonce_hex),
+            error: None,
+        }),
+    )
+}
+
+/// Validate that a string is a well-formed DNS label (RFC 1035).
+fn validate_dns_name(name: &str) -> bool {
+    if name.is_empty() || name.len() > 63 {
+        return false;
+    }
+    name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+}
+
+/// Verify a Schnorr signature over `message` using the spend public key
+/// derived from `sp_address`.
+///
+/// The message is SHA-256 hashed before verification, as required by
+/// the secp256k1 Schnorr signature scheme.
+fn verify_schnorr_signature(
+    signature_hex: &str,
+    message: &str,
+    sp_address: &SilentPaymentAddress,
+) -> Result<(), String> {
+    use secp256k1::{Message, Secp256k1, XOnlyPublicKey, schnorr::Signature};
+    use sha2::{Digest, Sha256};
+
+    // Decode hex signature
+    let sig_bytes =
+        hex::decode(signature_hex).map_err(|e| format!("Invalid signature hex: {}", e))?;
+    if sig_bytes.len() != 64 {
+        return Err(format!(
+            "Signature must be 64 bytes (got {})",
+            sig_bytes.len()
+        ));
+    }
+
+    // Parse Schnorr signature (secp256k1 0.28: schnorr::Signature, not SchnorrSig)
+    let sig = Signature::from_slice(&sig_bytes)
+        .map_err(|e| format!("Invalid signature encoding: {}", e))?;
+
+    // Get spend public key from SP address and convert to XOnlyPublicKey
+    // (Schnorr signatures use X-only point compression)
+    let spend_pubkey = sp_address.get_spend_key();
+    let pk_bytes = spend_pubkey.serialize();
+    let x_only_pubkey = XOnlyPublicKey::from_slice(&pk_bytes[1..])
+        .map_err(|e| format!("Invalid X-only pubkey: {}", e))?;
+
+    // SHA-256 hash the message
+    let mut hasher = Sha256::new();
+    hasher.update(message.as_bytes());
+    let digest = hasher.finalize();
+
+    // Create message from digest
+    let msg = Message::from_digest_slice(&digest).map_err(|e| format!("Invalid digest: {}", e))?;
+
+    // Verify
+    let secp = Secp256k1::new();
+    secp.verify_schnorr(&sig, &msg, &x_only_pubkey)
+        .map_err(|e| format!("Signature verification failed: {}", e))
+}
+
+/// Atomically claim a registration nonce so two concurrent requests with the
+/// same nonce cannot both proceed. Removes the nonce from the store under a
+/// write lock; the nonce is single-use — on any later failure the client must
+/// call `/register/prepare` again.
+async fn claim_nonce(
+    nonce_store: &Arc<RwLock<HashMap<String, NonceEntry>>>,
+    nonce: &str,
+    user_name: &str,
+    sp_address: &str,
+    domain: &str,
+) -> Result<(), String> {
+    let mut store = nonce_store.write().await;
+    // Validate while holding the write lock; if claimable, remove it atomically.
+    let claimable = match store.get(nonce) {
+        None => false,
+        Some(e) => {
+            !e.is_expired()
+                && e.user_name == user_name
+                && e.sp_address == sp_address
+                && e.domain == domain
+        }
+    };
+    if !claimable {
+        return match store.get(nonce) {
+            None => Err(
+                "Invalid or missing nonce. Please call /register/prepare first.".to_string(),
+            ),
+            Some(e) => {
+                if e.is_expired() {
+                    Err("Registration nonce expired. Please request a new one.".to_string())
+                } else {
+                    Err(
+                        "Nonce does not match this registration request. Request a new one."
+                            .to_string(),
+                    )
+                }
+            }
+        };
+    }
+    store.remove(nonce).expect("validated nonce is present");
+    Ok(())
+}
+
 async fn handle_register(
     State(state): State<Arc<AppState>>,
     Json(request): Json<RegisterRequest>,
 ) -> (StatusCode, AxumJson<RegisterResponse>) {
+    // Bound the in-memory nonce store by evicting expired entries
+    cleanup_expired_nonces(&state.nonce_store).await;
     // Just in case
     if state.zone_id.is_empty() || state.api_token.is_empty() {
         error!("Cloudflare credentials missing, DNS record creation failed");
@@ -314,11 +565,9 @@ async fn handle_register(
         }
     };
 
-    // TODO verify a signature over some message that user must provides with the request
-
-    // if user_name is empty, we generate a random one
+    // Extract user_name before validation (nonce may store None)
     let user_name = match request.user_name {
-        Some(user_name) => user_name,
+        Some(name) => name,
         None => {
             return (
                 StatusCode::BAD_REQUEST,
@@ -333,9 +582,74 @@ async fn handle_register(
         }
     };
 
+    // Atomically claim the nonce so concurrent requests with the same nonce
+    // cannot both proceed. Claim consumes it; on any later failure the client
+    // must call /register/prepare again.
+    if let Err(msg) = claim_nonce(
+        &state.nonce_store,
+        &request.nonce,
+        &user_name,
+        &request.sp_address,
+        &request.domain,
+    )
+    .await
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            AxumJson(RegisterResponse {
+                id: request.id,
+                message: msg,
+                dana_address: None,
+                sp_address: None,
+                dns_record_id: None,
+            }),
+        );
+    }
+
+    // Verify signature over the nonce + user_name + domain
+    let signed_message = format!(
+        "dana-register:{}:{}:{}:{}",
+        network_key, request.nonce, user_name, state.domain
+    );
+
+    if let Err(e) = verify_schnorr_signature(&request.signature, &signed_message, &sp_address) {
+        warn!(
+            "Signature verification failed for user '{}': {}",
+            user_name, e
+        );
+        return (
+            StatusCode::BAD_REQUEST,
+            AxumJson(RegisterResponse {
+                id: request.id,
+                message: format!("Invalid signature: {}", e),
+                dana_address: None,
+                sp_address: None,
+                dns_record_id: None,
+            }),
+        );
+    }
+    debug!("Signature verified for user '{}'", user_name);
+
+    // Validate DNS name before creating records
+    if !validate_dns_name(&user_name) {
+        return (
+            StatusCode::BAD_REQUEST,
+            AxumJson(RegisterResponse {
+                id: request.id,
+                message: "Invalid user name (alphanumeric and hyphens only, 1-63 chars)"
+                    .to_string(),
+                dana_address: None,
+                sp_address: None,
+                dns_record_id: None,
+            }),
+        );
+    }
+
     let dana_address = format!("{}@{}", user_name, state.domain);
     let txt_name = format!("{}.user._bitcoin-payment.{}", user_name, state.domain);
     let txt_content = format!("bitcoin:?{}={}", network_key, sp_address.to_string());
+
+    let _create_guard = state.register_create_lock.lock().await;
 
     // First check if the record already exists using DNS-over-HTTPS
     match fetch_sp_address_from_txt_record(&user_name, &state.domain, sp_address.get_network())
@@ -352,11 +666,12 @@ async fn handle_register(
                     existing.push(dana_address.clone());
                 }
                 dana_map.insert(dana_address.clone(), sp_address);
+
                 drop(sp_map);
                 drop(dana_map);
                 debug!(
                     "Updated maps for existing record: {} -> {}",
-                    dana_address, sp_address
+                    &dana_address, sp_address
                 );
                 return (
                     StatusCode::OK,
@@ -429,10 +744,11 @@ async fn handle_register(
                 existing.push(dana_address.clone());
                 info!(
                     "Added Dana address {} to SP address {} mapping",
-                    dana_address, sp_address
+                    &dana_address, sp_address
                 );
             }
             dana_map.insert(dana_address.clone(), sp_address);
+
             drop(sp_map);
             drop(dana_map);
             debug!(
@@ -701,6 +1017,8 @@ async fn main() {
         Arc::new(RwLock::new(HashMap::new()));
     let dana_to_sp: Arc<RwLock<HashMap<String, SilentPaymentAddress>>> =
         Arc::new(RwLock::new(HashMap::new()));
+    let nonce_store: Arc<RwLock<HashMap<String, NonceEntry>>> =
+        Arc::new(RwLock::new(HashMap::new()));
 
     // Populate the maps of sp addresses to dana addresses and vice versa on startup
     info!("Populating SP address to Dana address maps from Cloudflare records...");
@@ -856,11 +1174,14 @@ async fn main() {
         sp_to_dana,
         dana_to_sp,
         network,
+        nonce_store,
+        register_create_lock: Arc::new(tokio::sync::Mutex::new(())),
     });
 
     let v1_router = Router::new()
         .route("/info", get(handle_get_info))
         .route("/register", post(handle_register))
+        .route("/register/prepare", post(handle_register_prepare))
         .route("/lookup", get(handle_lookup_sp_address))
         .route("/search", get(handle_prefix_search));
 
@@ -938,7 +1259,96 @@ mod tests {
         )
         .await;
 
-        assert!(result.is_err());
+        // No TXT record => HrnResolutionError, which the function maps to Ok(None).
+        assert!(result.unwrap().is_none());
+    }
+
+    // ── Unit tests for signature verification, DNS name validation, nonce expiry ──
+
+    #[test]
+    fn test_verify_schnorr_signature_valid() {
+        use secp256k1::{Keypair, Secp256k1, SecretKey, XOnlyPublicKey};
+        use sha2::{Digest, Sha256};
+
+        let secp = Secp256k1::new();
+
+        // Generate a random keypair
+        let secret_key = SecretKey::new(&mut rand::thread_rng());
+        let keypair = Keypair::from_seckey_slice(&secp, secret_key.as_ref()).unwrap();
+        let (x_only_pubkey, _parity) = XOnlyPublicKey::from_keypair(&keypair);
+
+        // Hash a test message with SHA-256
+        let message = "dana-register:sp:testnonce:testuser:testdomain.com";
+        let mut hasher = Sha256::new();
+        hasher.update(message.as_bytes());
+        let digest = hasher.finalize();
+        let msg = secp256k1::Message::from_digest_slice(&digest).unwrap();
+
+        // Sign with an RNG and verify
+        let sig = secp.sign_schnorr_with_rng(&msg, &keypair, &mut rand::thread_rng());
+        assert!(secp.verify_schnorr(&sig, &msg, &x_only_pubkey).is_ok());
+    }
+
+    #[test]
+    fn test_verify_schnorr_signature_invalid() {
+        use secp256k1::{Keypair, Secp256k1, SecretKey, XOnlyPublicKey};
+        use sha2::{Digest, Sha256};
+
+        let secp = Secp256k1::new();
+
+        // Generate two different keypairs
+        let sk_a = SecretKey::new(&mut rand::thread_rng());
+        let keypair_a = Keypair::from_seckey_slice(&secp, sk_a.as_ref()).unwrap();
+        let (pk_a, _) = XOnlyPublicKey::from_keypair(&keypair_a);
+
+        let sk_b = SecretKey::new(&mut rand::thread_rng());
+        let keypair_b = Keypair::from_seckey_slice(&secp, sk_b.as_ref()).unwrap();
+        let (pk_b, _) = XOnlyPublicKey::from_keypair(&keypair_b);
+
+        // Sign with keypair_a, verify with keypair_b — should fail
+        let message = "dana-register:sp:testnonce:testuser:testdomain.com";
+        let mut hasher = Sha256::new();
+        hasher.update(message.as_bytes());
+        let digest = hasher.finalize();
+        let msg = secp256k1::Message::from_digest_slice(&digest).unwrap();
+
+        let sig = secp.sign_schnorr_with_rng(&msg, &keypair_a, &mut rand::thread_rng());
+        assert!(secp.verify_schnorr(&sig, &msg, &pk_b).is_err());
+    }
+
+    #[test]
+    fn test_validate_dns_name() {
+        assert!(validate_dns_name("alice"));
+        assert!(validate_dns_name("alice-123"));
+        assert!(validate_dns_name("a")); // min 1 char
+        assert!(!validate_dns_name("")); // empty
+        assert!(!validate_dns_name("alice bob")); // space
+        assert!(!validate_dns_name("alice@domain")); // @
+        assert!(!validate_dns_name(&"a".repeat(64))); // max 63
+        assert!(validate_dns_name(&"a".repeat(63))); // exactly 63
+        // Reject non-ASCII (Unicode) labels — RFC 1035 names are ASCII
+        assert!(!validate_dns_name("é"));
+        assert!(!validate_dns_name("日本語"));
+        assert!(!validate_dns_name("café"));
+    }
+
+    #[test]
+    fn test_nonce_expiry() {
+        let expired = NonceEntry {
+            user_name: "test".into(),
+            sp_address: "sp1test".into(),
+            domain: "test.com".into(),
+            expires_at: Instant::now() - Duration::from_secs(1),
+        };
+        assert!(expired.is_expired());
+
+        let fresh = NonceEntry {
+            user_name: "test".into(),
+            sp_address: "sp1test".into(),
+            domain: "test.com".into(),
+            expires_at: Instant::now() + Duration::from_secs(300),
+        };
+        assert!(!fresh.is_expired());
     }
     // --- Cloudflare API helper tests against a local mock server ---
     // These exercise create_txt_record / list_bitcoin_records without needing a
@@ -1071,4 +1481,82 @@ mod tests {
         assert_eq!(got[0].content, "bitcoin:sp1qq...");
     }
 
+#[tokio::test]
+async fn test_nonce_claim_is_atomic() {
+    let store = std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+    store.write().await.insert(
+        "n1".to_string(),
+        super::NonceEntry {
+            user_name: "alice".into(),
+            sp_address: "sp1alice".into(),
+            domain: "test.com".into(),
+            expires_at: std::time::Instant::now() + std::time::Duration::from_secs(300),
+        },
+    );
+
+    // Two concurrent claims for the same nonce: exactly one succeeds.
+    let a = super::claim_nonce(&store, "n1", "alice", "sp1alice", "test.com");
+    let b = super::claim_nonce(&store, "n1", "alice", "sp1alice", "test.com");
+    let (ra, rb) = tokio::join!(a, b);
+    assert!(matches!((ra.is_ok(), rb.is_ok()), (true, false) | (false, true)));
+}
+
+#[tokio::test]
+async fn test_nonce_claim_is_single_use() {
+    let store = std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+    store.write().await.insert(
+        "n1".to_string(),
+        super::NonceEntry {
+            user_name: "alice".into(),
+            sp_address: "sp1alice".into(),
+            domain: "test.com".into(),
+            expires_at: std::time::Instant::now() + std::time::Duration::from_secs(300),
+        },
+    );
+
+    assert!(
+        super::claim_nonce(&store, "n1", "alice", "sp1alice", "test.com")
+            .await
+            .is_ok()
+    );
+
+    // Claim removes the nonce; a retry must go through /register/prepare again.
+    let retry = super::claim_nonce(&store, "n1", "alice", "sp1alice", "test.com").await;
+    assert!(retry.is_err());
+}
+
+#[tokio::test]
+async fn test_nonce_claim_rejects_mismatch_and_expired() {
+    let store = std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+    store.write().await.insert(
+        "n1".to_string(),
+        super::NonceEntry {
+            user_name: "alice".into(),
+            sp_address: "sp1alice".into(),
+            domain: "test.com".into(),
+            expires_at: std::time::Instant::now() + std::time::Duration::from_secs(300),
+        },
+    );
+
+    // Claim with mismatched data is rejected and the nonce stays available.
+    let mismatch = super::claim_nonce(&store, "n1", "bob", "sp1bob", "test.com").await;
+    assert!(mismatch.is_err());
+
+    // The legitimate claim still works (the mismatched attempt did not consume it).
+    let legit = super::claim_nonce(&store, "n1", "alice", "sp1alice", "test.com").await;
+    assert!(legit.is_ok());
+
+    // An expired nonce is rejected.
+    store.write().await.insert(
+        "n2".to_string(),
+        super::NonceEntry {
+            user_name: "alice".into(),
+            sp_address: "sp1alice".into(),
+            domain: "test.com".into(),
+            expires_at: std::time::Instant::now() - std::time::Duration::from_secs(1),
+        },
+    );
+    let expired = super::claim_nonce(&store, "n2", "alice", "sp1alice", "test.com").await;
+    assert!(expired.is_err());
+}
 }
