@@ -11,16 +11,20 @@ use axum::{
 use spdk_wallet::bip321::Bip321Uri;
 use spdk_wallet::client::{parse_sp, parse_tsp, SpUriExtension};
 use log::{debug, error, info, warn};
+use rand::RngCore;
 use reqwest::Client;
 use silentpayments::{Network as SpNetwork, SilentPaymentCode};
 use dnssec_prover::{query::{ProofBuildingError, build_txt_proof_async}, rr::{Name, RR}, ser::parse_rr_stream, validation::verify_rr_stream};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 use std::{net::SocketAddr, str::FromStr, sync::Arc};
 use tokio::sync::RwLock;
 
 use crate::api_structs::{
-    ApiResponse, CloudflareRequest, GetInfoResponse, LookupRequest, LookupResponse,
-    PrefixSearchRequest, PrefixSearchResponse, Record, RegisterRequest, RegisterResponse,
+    ApiResponse, ChallengeRequest, ChallengeResponse, CloudflareRequest, GetInfoResponse,
+    LookupRequest, LookupResponse, PrefixSearchRequest, PrefixSearchResponse, Record,
+    RegisterRequest, RegisterResponse,
 };
 
 
@@ -33,6 +37,26 @@ fn cloudflare_base_url() -> String {
         .unwrap_or_else(|_| CLOUDFLARE_API_BASE_URL.to_string())
 }
 
+// challenge-auth (branch 1): nonce TTL and rate-limit bounds
+const NONCE_TTL_SECS: u64 = 300; // 5 minutes
+const MAX_PENDING_NONCES: u64 = 10_000;
+const MAX_NONCES_PER_PEER: u32 = 10;
+
+/// A nonce issued by the challenge endpoint. Bound to the user_name / SP
+/// address / domain it was minted for so a later claim must match all three.
+#[derive(Clone)]
+struct NonceEntry {
+    user_name: String,
+    sp_address: String,
+    domain: String,
+    expires_at: Instant,
+}
+
+impl NonceEntry {
+    fn is_expired(&self) -> bool {
+        Instant::now() > self.expires_at
+    }
+}
 
 #[derive(Clone)]
 struct AppState {
@@ -43,6 +67,14 @@ struct AppState {
     dana_to_sp: Arc<RwLock<HashMap<String, SilentPaymentCode>>>,
     // we only accept registration requests from this network
     network: SpNetwork,
+    // Challenge-response nonce store for signature auth
+    nonce_store: Arc<RwLock<HashMap<String, NonceEntry>>>,
+    // Per-peer outstanding nonce counts (keyed by request id) for rate limiting
+    peer_nonce_counts: Arc<RwLock<HashMap<String, u32>>>,
+    // Global outstanding-nonce counter for the aggregate cap
+    outstanding_nonces: Arc<AtomicU64>,
+    max_pending_nonces: u64,
+    max_nonces_per_peer: u32,
 }
 
 async fn handle_get_info(
@@ -61,6 +93,270 @@ static DNS_RESOLVER_ADDR: SocketAddr = std::net::SocketAddr::V4(std::net::Socket
 
 fn has_bitcoin_prefix(data: &[u8]) -> bool {
     data.starts_with(b"bitcoin:")
+}
+
+/// Validate that a string is a well-formed DNS label (RFC 1035).
+fn validate_dns_name(name: &str) -> bool {
+    if name.is_empty() || name.len() > 63 {
+        return false;
+    }
+    name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+}
+
+/// Challenge endpoint: issue a single-use nonce bound to the user_name / SP
+/// address / domain. The client signs the returned message with the spend
+/// private key; a later register/remove request supplies signature + nonce so
+/// the server can verify ownership of the SP address.
+async fn handle_challenge(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<ChallengeRequest>,
+) -> (StatusCode, AxumJson<ChallengeResponse>) {
+    // Domain must match the one we serve
+    if request.domain != state.domain {
+        return (
+            StatusCode::BAD_REQUEST,
+            AxumJson(ChallengeResponse {
+                id: request.id,
+                message: format!("Server registers for domain: {}", state.domain),
+                nonce: String::new(),
+                network_key: String::new(),
+                expires_at: 0,
+            }),
+        );
+    }
+
+    // User name is required and must be DNS-valid (we bind the nonce to it)
+    if request.user_name.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            AxumJson(ChallengeResponse {
+                id: request.id,
+                message: "User name is required".to_string(),
+                nonce: String::new(),
+                network_key: String::new(),
+                expires_at: 0,
+            }),
+        );
+    }
+    if !validate_dns_name(&request.user_name) {
+        return (
+            StatusCode::BAD_REQUEST,
+            AxumJson(ChallengeResponse {
+                id: request.id,
+                message:
+                    "Invalid user name: must be ASCII alphanumeric and hyphens only, 1-63 chars"
+                        .to_string(),
+                nonce: String::new(),
+                network_key: String::new(),
+                expires_at: 0,
+            }),
+        );
+    }
+
+    // Parse and validate the SP address
+    let sp_address = match SilentPaymentCode::try_from(request.sp_address.clone()) {
+        Ok(addr) => {
+            debug!("Valid SP address: {}", addr);
+            addr
+        }
+        Err(e) => {
+            error!("Invalid SP address '{}': {}", request.sp_address, e);
+            return (
+                StatusCode::BAD_REQUEST,
+                AxumJson(ChallengeResponse {
+                    id: request.id,
+                    message: format!("Invalid SP address: {}", e),
+                    nonce: String::new(),
+                    network_key: String::new(),
+                    expires_at: 0,
+                }),
+            );
+        }
+    };
+
+    // Network must match the one this server serves
+    if sp_address.network() != state.network {
+        return (
+            StatusCode::BAD_REQUEST,
+            AxumJson(ChallengeResponse {
+                id: request.id,
+                message: format!(
+                    "Address has wrong network type: {:?}, expected: {:?}",
+                    sp_address.network(),
+                    state.network
+                ),
+                nonce: String::new(),
+                network_key: String::new(),
+                expires_at: 0,
+            }),
+        );
+    }
+
+    // We modify the key depending on the network (mainnet vs signet/testnet)
+    let network_key = match sp_address.network() {
+        SpNetwork::Mainnet => "sp",
+        SpNetwork::Testnet => "tsp",
+        SpNetwork::Regtest => {
+            return (
+                StatusCode::BAD_REQUEST,
+                AxumJson(ChallengeResponse {
+                    id: request.id,
+                    message: "Can't issue a challenge for regtest addresses".to_string(),
+                    nonce: String::new(),
+                    network_key: String::new(),
+                    expires_at: 0,
+                }),
+            );
+        }
+    };
+
+    // Rate limiting: global aggregate cap, then per-peer cap.
+    // The peer key is the client-supplied request id.
+    let peer = request.id.clone();
+    if state.outstanding_nonces.load(Ordering::SeqCst) >= state.max_pending_nonces {
+        warn!("Rejecting challenge request: nonce store at capacity");
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            AxumJson(ChallengeResponse {
+                id: request.id,
+                message: "Too many pending challenges, please retry later".to_string(),
+                nonce: String::new(),
+                network_key: String::new(),
+                expires_at: 0,
+            }),
+        );
+    }
+    {
+        let mut counts = state.peer_nonce_counts.write().await;
+        let count = counts.entry(peer.clone()).or_insert(0);
+        if *count >= state.max_nonces_per_peer {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                AxumJson(ChallengeResponse {
+                    id: request.id,
+                    message: "Too many pending challenges from this peer".to_string(),
+                    nonce: String::new(),
+                    network_key: String::new(),
+                    expires_at: 0,
+                }),
+            );
+        }
+        *count += 1;
+    }
+
+    // Mint a 32-byte random nonce, hex-encoded
+    let mut nonce_bytes = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut nonce_bytes);
+    let nonce = hex::encode(nonce_bytes);
+
+    // Store the nonce entry and bump the global counter
+    {
+        let mut store = state.nonce_store.write().await;
+        store.insert(
+            nonce.clone(),
+            NonceEntry {
+                user_name: request.user_name.clone(),
+                sp_address: sp_address.to_string(),
+                domain: state.domain.clone(),
+                expires_at: Instant::now() + Duration::from_secs(NONCE_TTL_SECS),
+            },
+        );
+    }
+    state.outstanding_nonces.fetch_add(1, Ordering::SeqCst);
+
+    let expires_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() + NONCE_TTL_SECS)
+        .unwrap_or(0);
+
+    info!(
+        "Generated nonce for user {} on domain {} (expires in {}s)",
+        request.user_name, state.domain, NONCE_TTL_SECS
+    );
+
+    (
+        StatusCode::OK,
+        AxumJson(ChallengeResponse {
+            id: request.id,
+            message: format!("dana:v1:challenge:{}:{}", network_key, nonce),
+            nonce,
+            network_key: network_key.to_string(),
+            expires_at,
+        }),
+    )
+}
+
+/// Verify a Schnorr signature over `message` using the spend public key
+/// derived from `sp_address`. The message is SHA-256 hashed before
+/// verification, as required by the secp256k1 Schnorr signature scheme.
+fn verify_schnorr_signature(
+    signature_hex: &str,
+    message: &str,
+    sp_address: &SilentPaymentCode,
+) -> Result<(), String> {
+    use silentpayments::secp256k1::{Message, Secp256k1, XOnlyPublicKey, schnorr::Signature};
+
+    let sig_bytes = hex::decode(signature_hex).map_err(|e| format!("Invalid signature hex: {}", e))?;
+    if sig_bytes.len() != 64 {
+        return Err(format!(
+            "Signature must be 64 bytes (got {})",
+            sig_bytes.len()
+        ));
+    }
+    let sig = Signature::from_slice(&sig_bytes)
+        .map_err(|e| format!("Invalid signature encoding: {}", e))?;
+
+    // Spend public key from the SP address, converted to X-only
+    let spend_pubkey = sp_address.m_pubkey();
+    let pk_bytes = spend_pubkey.serialize();
+    let x_only = XOnlyPublicKey::from_slice(&pk_bytes[1..])
+        .map_err(|e| format!("Invalid X-only pubkey: {}", e))?;
+
+    // SHA-256 hash the message
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(message.as_bytes());
+    let msg = Message::from_digest_slice(&digest)
+        .map_err(|e| format!("Invalid digest: {}", e))?;
+
+    let secp = Secp256k1::new();
+    secp.verify_schnorr(&sig, &msg, &x_only)
+        .map_err(|e| format!("Signature verification failed: {}", e))
+}
+
+/// Atomically claim a nonce: it must exist, match the user_name / SP address /
+/// domain, and not be expired. Claiming consumes it (single-use); on any later
+/// failure the client must request a fresh challenge.
+async fn claim_nonce(
+    nonce_store: &Arc<RwLock<HashMap<String, NonceEntry>>>,
+    outstanding_nonces: &AtomicU64,
+    nonce: &str,
+    user_name: &str,
+    sp_address: &str,
+    domain: &str,
+) -> Result<(), String> {
+    let mut store = nonce_store.write().await;
+    let entry = match store.get(nonce) {
+        Some(entry) => entry,
+        None => {
+            return Err("Invalid or missing nonce. Please call /challenge first.".to_string());
+        }
+    };
+    if entry.is_expired() {
+        return Err("Challenge nonce expired. Please request a new one.".to_string());
+    }
+    if entry.user_name != user_name || entry.sp_address != sp_address || entry.domain != domain {
+        return Err("Nonce does not match this request. Request a new one.".to_string());
+    }
+    store.remove(nonce).expect("validated nonce is present");
+    drop(store);
+    outstanding_nonces.fetch_sub(1, Ordering::SeqCst);
+    Ok(())
+}
+
+/// Remove expired nonce entries to bound the in-memory store.
+async fn cleanup_expired_nonces(nonce_store: &Arc<RwLock<HashMap<String, NonceEntry>>>) {
+    let mut store = nonce_store.write().await;
+    store.retain(|_, entry| !entry.is_expired());
 }
 
 async fn fetch_sp_address_from_txt_record(
@@ -848,13 +1144,35 @@ async fn main() {
         sp_to_dana,
         dana_to_sp,
         network,
+        nonce_store: Arc::new(RwLock::new(HashMap::new())),
+        peer_nonce_counts: Arc::new(RwLock::new(HashMap::new())),
+        outstanding_nonces: Arc::new(AtomicU64::new(0)),
+        max_pending_nonces: MAX_PENDING_NONCES,
+        max_nonces_per_peer: MAX_NONCES_PER_PEER,
     });
 
     let v1_router = Router::new()
         .route("/info", get(handle_get_info))
+        .route("/challenge", post(handle_challenge))
         .route("/register", post(handle_register))
         .route("/lookup", get(handle_lookup_sp_address))
         .route("/search", get(handle_prefix_search));
+
+    // Periodically evict expired nonces to bound the in-memory store
+    {
+        let store = state.nonce_store.clone();
+        let counter = state.outstanding_nonces.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(60));
+            loop {
+                interval.tick().await;
+                cleanup_expired_nonces(&store).await;
+                // Reset the global counter to the live store size
+                let size = store.read().await.len() as u64;
+                counter.store(size, Ordering::SeqCst);
+            }
+        });
+    }
 
     let app = Router::new().nest("/v1", v1_router).with_state(state);
 
@@ -1053,6 +1371,204 @@ mod tests {
         assert_eq!(got[0].name, "user._bitcoin-payment.example.com.");
         assert_eq!(got[0].record_type, "TXT");
         assert_eq!(got[0].content, "bitcoin:sp1qq...");
+    }
+
+    // ── Challenge-auth (branch 1): DNS name validation ──
+
+    #[test]
+    fn test_validate_dns_name_valid() {
+        assert!(validate_dns_name("alice"));
+        assert!(validate_dns_name("alice-1"));
+        assert!(validate_dns_name("a".repeat(63).as_str()));
+    }
+
+    #[test]
+    fn test_validate_dns_name_invalid() {
+        assert!(!validate_dns_name(""));
+        assert!(!validate_dns_name("a".repeat(64).as_str()));
+        assert!(!validate_dns_name("alice@example"));
+        assert!(!validate_dns_name("alice bob"));
+        assert!(!validate_dns_name("alice."));
+    }
+
+    // Helper: build a SilentPaymentAddress from a scan key and a spend key.
+    fn make_sp_address(
+        secp: &silentpayments::secp256k1::Secp256k1<silentpayments::secp256k1::All>,
+        scan_secret: &silentpayments::secp256k1::SecretKey,
+        spend_secret: &silentpayments::secp256k1::SecretKey,
+    ) -> SilentPaymentCode {
+        let scan_pub = scan_secret.public_key(secp);
+        let spend_pub = spend_secret.public_key(secp);
+        SilentPaymentCode::new_v0(scan_pub, spend_pub, SpNetwork::Mainnet)
+    }
+
+    #[test]
+    fn test_verify_schnorr_signature_valid() {
+        use silentpayments::secp256k1::{Keypair, Message, Secp256k1, SecretKey};
+        use sha2::{Digest, Sha256};
+        use rand::thread_rng;
+
+        let secp = Secp256k1::new();
+        let scan_secret = SecretKey::new(&mut thread_rng());
+        let spend_secret = SecretKey::new(&mut thread_rng());
+        let sp_addr = make_sp_address(&secp, &scan_secret, &spend_secret);
+
+        let message = "dana:v1:challenge:sp:deadbeef";
+        let digest = Sha256::digest(message.as_bytes());
+        let msg = Message::from_digest_slice(&digest).unwrap();
+
+        let keypair = Keypair::from_seckey_slice(&secp, &spend_secret.secret_bytes()).unwrap();
+        let sig = secp.sign_schnorr_with_rng(&msg, &keypair, &mut thread_rng());
+        let sig_hex = hex::encode(sig.serialize());
+
+        assert!(verify_schnorr_signature(&sig_hex, message, &sp_addr).is_ok());
+    }
+
+    #[test]
+    fn test_verify_schnorr_signature_invalid() {
+        use silentpayments::secp256k1::{Keypair, Message, Secp256k1, SecretKey};
+        use sha2::{Digest, Sha256};
+        use rand::thread_rng;
+
+        let secp = Secp256k1::new();
+        let scan_secret = SecretKey::new(&mut thread_rng());
+        let spend_secret = SecretKey::new(&mut thread_rng());
+        let sp_addr = make_sp_address(&secp, &scan_secret, &spend_secret);
+
+        let message = "dana:v1:challenge:sp:deadbeef";
+        let digest = Sha256::digest(message.as_bytes());
+        let msg = Message::from_digest_slice(&digest).unwrap();
+
+        // Sign with a different key than the spend key embedded in sp_addr
+        let other_secret = SecretKey::new(&mut thread_rng());
+        let keypair = Keypair::from_seckey_slice(&secp, &other_secret.secret_bytes()).unwrap();
+        let sig = secp.sign_schnorr_with_rng(&msg, &keypair, &mut thread_rng());
+        let sig_hex = hex::encode(sig.serialize());
+
+        assert!(verify_schnorr_signature(&sig_hex, message, &sp_addr).is_err());
+
+        // Also reject a malformed / wrong-length signature
+        assert!(verify_schnorr_signature("deadbeef", message, &sp_addr).is_err());
+    }
+
+    // ── Challenge-auth (branch 1): nonce claim + expiry ──
+
+    #[tokio::test]
+    async fn test_claim_nonce_single_use() {
+        let store: Arc<RwLock<HashMap<String, NonceEntry>>> = Arc::new(RwLock::new(HashMap::new()));
+        let counter = Arc::new(AtomicU64::new(1));
+
+        store.write().await.insert(
+            "nonce1".to_string(),
+            NonceEntry {
+                user_name: "alice".to_string(),
+                sp_address: "sp1qq...".to_string(),
+                domain: "danawallet.app".to_string(),
+                expires_at: Instant::now() + Duration::from_secs(60),
+            },
+        );
+
+        assert!(
+            claim_nonce(&store, &counter, "nonce1", "alice", "sp1qq...", "danawallet.app")
+                .await
+                .is_ok()
+        );
+        assert_eq!(counter.load(Ordering::SeqCst), 0);
+
+        // Single-use: a second claim fails because the nonce was consumed
+        assert!(
+            claim_nonce(&store, &counter, "nonce1", "alice", "sp1qq...", "danawallet.app")
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_claim_nonce_mismatch() {
+        let store: Arc<RwLock<HashMap<String, NonceEntry>>> = Arc::new(RwLock::new(HashMap::new()));
+        let counter = Arc::new(AtomicU64::new(1));
+
+        store.write().await.insert(
+            "nonce1".to_string(),
+            NonceEntry {
+                user_name: "alice".to_string(),
+                sp_address: "sp1qq...".to_string(),
+                domain: "danawallet.app".to_string(),
+                expires_at: Instant::now() + Duration::from_secs(60),
+            },
+        );
+
+        // Wrong user name
+        assert!(
+            claim_nonce(&store, &counter, "nonce1", "bob", "sp1qq...", "danawallet.app")
+                .await
+                .is_err()
+        );
+        // Wrong SP address
+        assert!(
+            claim_nonce(&store, &counter, "nonce1", "alice", "sp1qq2...", "danawallet.app")
+                .await
+                .is_err()
+        );
+        // Wrong domain
+        assert!(
+            claim_nonce(&store, &counter, "nonce1", "alice", "sp1qq...", "example.com")
+                .await
+                .is_err()
+        );
+        // Counter is not decremented on failure
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn test_claim_nonce_expired() {
+        let store: Arc<RwLock<HashMap<String, NonceEntry>>> = Arc::new(RwLock::new(HashMap::new()));
+        let counter = Arc::new(AtomicU64::new(1));
+
+        store.write().await.insert(
+            "nonce1".to_string(),
+            NonceEntry {
+                user_name: "alice".to_string(),
+                sp_address: "sp1qq...".to_string(),
+                domain: "danawallet.app".to_string(),
+                expires_at: Instant::now() - Duration::from_secs(1),
+            },
+        );
+
+        assert!(
+            claim_nonce(&store, &counter, "nonce1", "alice", "sp1qq...", "danawallet.app")
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_expired_nonces() {
+        let store: Arc<RwLock<HashMap<String, NonceEntry>>> = Arc::new(RwLock::new(HashMap::new()));
+        store.write().await.insert(
+            "expired".to_string(),
+            NonceEntry {
+                user_name: "alice".to_string(),
+                sp_address: "sp1qq...".to_string(),
+                domain: "danawallet.app".to_string(),
+                expires_at: Instant::now() - Duration::from_secs(10),
+            },
+        );
+        store.write().await.insert(
+            "fresh".to_string(),
+            NonceEntry {
+                user_name: "bob".to_string(),
+                sp_address: "sp1qq2...".to_string(),
+                domain: "danawallet.app".to_string(),
+                expires_at: Instant::now() + Duration::from_secs(60),
+            },
+        );
+
+        cleanup_expired_nonces(&store).await;
+
+        let store = store.read().await;
+        assert!(store.contains_key("fresh"));
+        assert!(!store.contains_key("expired"));
     }
 
 }

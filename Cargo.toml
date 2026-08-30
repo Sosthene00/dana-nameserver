@@ -13,7 +13,7 @@ strip = true         # Strip symbols from binary
 
 [dependencies]
 anyhow = "1.0"
-tokio = { version = "1.0", features = ["macros", "rt-multi-thread"] }
+tokio = { version = "1.0", features = ["macros", "rt-multi-thread", "time"] }
 axum = { version = "0.8.5", default-features = false, features = ["http1", "json", "query", "tokio"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -24,6 +24,11 @@ env_logger = "0.10"
 dnssec-prover = { version = "0.6.10", features = ["tokio", "std"] }
 silentpayments = { git = "https://github.com/cygnet3/spdk", rev = "71649ed6647dec8235fd3e8fa5db4f3991db90fc", default-features = false, features = ["encode"] }
 spdk-wallet = { git = "https://github.com/cygnet3/spdk", rev = "71649ed6647dec8235fd3e8fa5db4f3991db90fc", package = "spdk-wallet", default-features = false }
+
+# challenge-auth (branch 1): challenge-response signature verification
+hex = "0.4"
+rand = "0.8"
+sha2 = "0.10"
 
 [dev-dependencies]
 wiremock = "0.6"

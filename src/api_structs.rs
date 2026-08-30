@@ -97,3 +97,21 @@ where
     };
     serializer.serialize_str(name)
 }
+
+// Challenge endpoint types (challenge-auth, branch 1)
+#[derive(Debug, Deserialize, Serialize)]
+pub struct ChallengeRequest {
+    pub id: String,
+    pub domain: String,
+    pub user_name: String,
+    pub sp_address: String,
+}
+
+#[derive(Serialize)]
+pub struct ChallengeResponse {
+    pub id: String,
+    pub message: String,
+    pub nonce: String,
+    pub network_key: String,
+    pub expires_at: u64,
+}
