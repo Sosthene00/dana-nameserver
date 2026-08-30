@@ -103,3 +103,39 @@ pub struct RegisterPrepareResponse {
     pub nonce: Option<String>,
     pub error: Option<String>,
 }
+
+// Remove endpoint types
+#[derive(Deserialize, Serialize)]
+pub struct RemovePrepareRequest {
+    pub id: String,
+    pub domain: String,
+    pub user_name: Option<String>,
+    pub sp_address: String,
+}
+
+#[derive(Serialize)]
+pub struct RemovePrepareResponse {
+    pub id: String,
+    pub message: String,
+    pub nonce: Option<String>,
+    pub error: Option<String>,
+}
+
+#[derive(Deserialize, Serialize)]
+pub struct RemoveRequest {
+    pub id: String,
+    pub domain: String,
+    pub user_name: Option<String>,
+    pub sp_address: String,
+    pub signature: String,
+    pub nonce: String,
+}
+
+#[derive(Serialize)]
+pub struct RemoveResponse {
+    pub id: String,
+    pub message: String,
+    pub dana_address: Option<String>,
+    pub sp_address: Option<String>,
+    pub dns_record_id: Option<String>,
+}

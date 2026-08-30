@@ -23,7 +23,8 @@ use tokio::sync::RwLock;
 use crate::api_structs::{
     ApiResponse, CloudflareRequest, GetInfoResponse, LookupRequest, LookupResponse,
     PrefixSearchRequest, PrefixSearchResponse, Record, RegisterPrepareRequest,
-    RegisterPrepareResponse, RegisterRequest, RegisterResponse,
+    RegisterPrepareResponse, RegisterRequest, RegisterResponse, RemovePrepareRequest,
+    RemovePrepareResponse, RemoveRequest, RemoveResponse,
 };
 
 const CLOUDFLARE_API_BASE_URL: &str = "https://api.cloudflare.com/client/v4";
@@ -1182,6 +1183,8 @@ async fn main() {
         .route("/info", get(handle_get_info))
         .route("/register", post(handle_register))
         .route("/register/prepare", post(handle_register_prepare))
+        .route("/remove", post(handle_remove))
+        .route("/remove/prepare", post(handle_remove_prepare))
         .route("/lookup", get(handle_lookup_sp_address))
         .route("/search", get(handle_prefix_search));
 
@@ -1202,6 +1205,511 @@ async fn main() {
     axum::serve(listener, app)
         .await
         .expect("Failed to start server");
+}
+
+
+/// Delete a Cloudflare DNS TXT record by its record id.
+async fn delete_txt_record(
+    client: &Client,
+    zone_id: &str,
+    api_token: &str,
+    record_id: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let url = format!(
+        "{}/zones/{}/dns_records/{}",
+        cloudflare_base_url(),
+        zone_id,
+        record_id
+    );
+
+    debug!("Deleting TXT record with ID: {}", record_id);
+    debug!("Using Cloudflare API URL: {}", url);
+
+    let response = client
+        .delete(&url)
+        .header("Authorization", format!("Bearer {}", api_token))
+        .send()
+        .await?;
+
+    if response.status().is_success() {
+        info!("Successfully deleted TXT record {}", record_id);
+        Ok(())
+    } else {
+        let error_text = response.text().await?;
+        error!(
+            "Cloudflare API error deleting record {}: {}",
+            record_id, error_text
+        );
+        Err(Box::new(std::io::Error::other(format!("Cloudflare API delete failed: {}", error_text))))
+    }
+}
+
+/// Find the Cloudflare record id whose TXT record name equals
+/// `{user_name}.user._bitcoin-payment.{domain}` and whose content's SP address
+/// equals `sp_address`. Returns None if no matching record exists.
+async fn find_bitcoin_record_id(
+    zone_id: &str,
+    api_token: &str,
+    domain: &str,
+    user_name: &str,
+    network_key: &str,
+    sp_address: &SilentPaymentAddress,
+) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
+    let target_name = format!("{}.user._bitcoin-payment.{}", user_name, domain);
+    let target_name_trailing = format!("{}.", target_name);
+    let sp_str = sp_address.to_string();
+    let key_eq = format!("{}={}", network_key, sp_str);
+
+    let records = list_bitcoin_records(zone_id, api_token, domain).await?;
+    for record in records {
+        if record.name != target_name && record.name != target_name_trailing {
+            continue;
+        }
+        // Content may be split across multiple TXT chunks joined by spaces, and
+        // each chunk may be JSON-string-encoded (mirrors startup parsing).
+        let content: String = record
+            .content
+            .split_whitespace()
+            .map(|chunk| match serde_json::from_str(chunk) {
+                Ok(chunk) => chunk,
+                Err(_) => chunk,
+            })
+            .collect();
+        let sp_part_ok = content
+            .strip_prefix("bitcoin:?")
+            .is_some_and(|sp_part| sp_part.split('&').any(|p| p == key_eq));
+        if sp_part_ok {
+            return Ok(Some(record.id.clone()));
+        }
+    }
+    Ok(None)
+}
+
+enum RemoveOwnershipError {
+    NotFound(String),
+    Forbidden(String),
+    Internal(String),
+}
+
+/// Ownership check for remove: only the **current** owner of the entry may
+/// remove it. Resolves the live TXT record for `user_name` and requires its SP
+/// address to equal the signer's claimed `sp_address`; otherwise a squatter
+/// holding a nonce for a different SP could delete someone else's mapping.
+/// On success, returns the Cloudflare record id to delete.
+async fn remove_ownership_ok(
+    user_name: &str,
+    sp_address: &SilentPaymentAddress,
+    state: &Arc<AppState>,
+) -> Result<String, RemoveOwnershipError> {
+    // 1. Resolve the current TXT record via DNS-over-HTTPS.
+    let current_sp = match fetch_sp_address_from_txt_record(
+        user_name,
+        &state.domain,
+        sp_address.get_network(),
+    )
+    .await
+    {
+        Ok(Some(sp)) => sp,
+        Ok(None) => {
+            return Err(RemoveOwnershipError::NotFound(format!(
+                "No TXT record found for {}@{}",
+                user_name, state.domain
+            )));
+        }
+        Err(e) => {
+            return Err(RemoveOwnershipError::Internal(format!(
+                "DNS lookup failed for {}@{}: {}",
+                user_name, state.domain, e
+            )));
+        }
+    };
+
+    // 2. Only the current owner (whose spend key signed) may remove.
+    if current_sp != *sp_address {
+        return Err(RemoveOwnershipError::Forbidden(format!(
+            "Only the current owner of {}@{} may remove this entry",
+            user_name, state.domain
+        )));
+    }
+
+    // 3. Ownership verified — find the Cloudflare record id for that TXT record.
+    let network_key = match sp_address.get_network() {
+        SpNetwork::Mainnet => "sp",
+        SpNetwork::Testnet => "tsp",
+        SpNetwork::Regtest => "sp", // unreachable: server rejects regtest
+    };
+    match find_bitcoin_record_id(
+        &state.zone_id,
+        &state.api_token,
+        &state.domain,
+        user_name,
+        network_key,
+        sp_address,
+    )
+    .await
+    {
+        Ok(Some(record_id)) => Ok(record_id),
+        Ok(None) => Err(RemoveOwnershipError::NotFound(format!(
+            "No matching Cloudflare record for {}@{}",
+            user_name, state.domain
+        ))),
+        Err(e) => Err(RemoveOwnershipError::Internal(format!(
+            "Cloudflare lookup failed for {}@{}: {}",
+            user_name, state.domain, e
+        ))),
+    }
+}
+
+/// Prepare a nonce for challenge-response remove authentication.
+async fn handle_remove_prepare(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<RemovePrepareRequest>,
+) -> (StatusCode, AxumJson<RemovePrepareResponse>) {
+    // Bound the in-memory nonce store by evicting expired entries.
+    cleanup_expired_nonces(&state.nonce_store).await;
+    // Validate domain matches state domain.
+    if request.domain != state.domain {
+        return (
+            StatusCode::BAD_REQUEST,
+            AxumJson(RemovePrepareResponse {
+                id: request.id,
+                message: format!("Server registers for domain: {}", state.domain),
+                nonce: None,
+                error: None,
+            }),
+        );
+    }
+
+    // Validate user_name is present and non-empty.
+    let user_name = match request.user_name {
+        Some(ref name) if !name.is_empty() => name.clone(),
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                AxumJson(RemovePrepareResponse {
+                    id: request.id,
+                    message: "User name is required".to_string(),
+                    nonce: None,
+                    error: None,
+                }),
+            );
+        }
+    };
+    // Reject DNS-invalid user names before issuing a nonce.
+    if !validate_dns_name(&user_name) {
+        return (
+            StatusCode::BAD_REQUEST,
+            AxumJson(RemovePrepareResponse {
+                id: request.id,
+                message: "Invalid user name: must be ASCII alphanumeric and hyphens only, 1-63 chars"
+                    .to_string(),
+                nonce: None,
+                error: None,
+            }),
+        );
+    }
+
+    // Parse SP address.
+    let sp_address = match SilentPaymentAddress::try_from(request.sp_address.clone()) {
+        Ok(sp_address) => sp_address,
+        Err(e) => {
+            error!("Invalid SP address '{}': {}", request.sp_address, e);
+            return (
+                StatusCode::BAD_REQUEST,
+                AxumJson(RemovePrepareResponse {
+                    id: request.id,
+                    message: format!("Invalid SP address: {}", e),
+                    nonce: None,
+                    error: None,
+                }),
+            );
+        }
+    };
+
+    // Validate SP address network matches state network.
+    if sp_address.get_network() != state.network {
+        return (
+            StatusCode::BAD_REQUEST,
+            AxumJson(RemovePrepareResponse {
+                id: request.id,
+                message: format!(
+                    "Registered address has wrong network type: {:?}, expected: {:?}",
+                    sp_address.get_network(),
+                    state.network
+                ),
+                nonce: None,
+                error: None,
+            }),
+        );
+    }
+
+    // Generate a 32-byte random nonce.
+    let mut nonce_bytes = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut nonce_bytes);
+    let nonce_hex = hex::encode(nonce_bytes);
+
+    // Store the nonce in the nonce store.
+    let nonce_entry = NonceEntry {
+        user_name: user_name.clone(),
+        sp_address: sp_address.to_string(),
+        domain: state.domain.clone(),
+        expires_at: Instant::now() + Duration::from_secs(NONCE_TTL_SECS),
+    };
+
+    let mut store = state.nonce_store.write().await;
+    store.insert(nonce_hex.clone(), nonce_entry);
+    drop(store);
+
+    info!(
+        "Generated remove nonce for user {} on domain {} (expires in {}s)",
+        user_name, state.domain, NONCE_TTL_SECS
+    );
+
+    (
+        StatusCode::OK,
+        AxumJson(RemovePrepareResponse {
+            id: request.id,
+            message: "Nonce generated successfully".to_string(),
+            nonce: Some(nonce_hex),
+            error: None,
+        }),
+    )
+}
+
+/// Remove an entry: verify the signature over `dana-remove:…`, enforce
+/// owner-only deletion, delete the Cloudflare TXT record, and update the
+/// in-memory maps.
+async fn handle_remove(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<RemoveRequest>,
+) -> (StatusCode, AxumJson<RemoveResponse>) {
+    cleanup_expired_nonces(&state.nonce_store).await;
+    // Just in case.
+    if state.zone_id.is_empty() || state.api_token.is_empty() {
+        error!("Cloudflare credentials missing, DNS record deletion failed");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            AxumJson(RemoveResponse {
+                id: request.id,
+                message: "Internal server error, please try again later".to_string(),
+                dana_address: None,
+                sp_address: None,
+                dns_record_id: None,
+            }),
+        );
+    }
+
+    // If the domain asked by client is not the domain we're removing from, return bad request.
+    if request.domain != state.domain {
+        return (
+            StatusCode::BAD_REQUEST,
+            AxumJson(RemoveResponse {
+                id: request.id,
+                message: format!("Server registers for domain: {}", state.domain),
+                dana_address: None,
+                sp_address: None,
+                dns_record_id: None,
+            }),
+        );
+    }
+
+    // Validate SP address.
+    let sp_address = match SilentPaymentAddress::try_from(request.sp_address.clone()) {
+        Ok(sp_address) => sp_address,
+        Err(e) => {
+            error!("Invalid SP address '{}': {}", request.sp_address, e);
+            return (
+                StatusCode::BAD_REQUEST,
+                AxumJson(RemoveResponse {
+                    id: request.id,
+                    message: format!("Invalid SP address: {}", e),
+                    dana_address: None,
+                    sp_address: None,
+                    dns_record_id: None,
+                }),
+            );
+        }
+    };
+
+    if sp_address.get_network() != state.network {
+        return (
+            StatusCode::BAD_REQUEST,
+            AxumJson(RemoveResponse {
+                id: request.id,
+                message: format!(
+                    "Registered address has wrong network type: {:?}, expected: {:?}",
+                    sp_address.get_network(),
+                    state.network
+                ),
+                dana_address: None,
+                sp_address: None,
+                dns_record_id: None,
+            }),
+        );
+    }
+
+    // Extract user_name (nonce may store None).
+    let user_name = match request.user_name {
+        Some(name) => name,
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                AxumJson(RemoveResponse {
+                    id: request.id,
+                    message: "User name is required".to_string(),
+                    dana_address: None,
+                    sp_address: None,
+                    dns_record_id: None,
+                }),
+            );
+        }
+    };
+
+    // Atomically claim the nonce (single-use): it must exist, be unexpired,
+    // and match the request's user_name + sp_address + domain.
+    if let Err(e) = claim_nonce(
+        &state.nonce_store,
+        &request.nonce,
+        &user_name,
+        &sp_address.to_string(),
+        &state.domain,
+    )
+    .await
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            AxumJson(RemoveResponse {
+                id: request.id,
+                message: e,
+                dana_address: None,
+                sp_address: None,
+                dns_record_id: None,
+            }),
+        );
+    }
+
+    // Verify the Schnorr signature over dana-remove:{network_key}:{nonce}:{user_name}:{domain}.
+    let network_key = match sp_address.get_network() {
+        SpNetwork::Mainnet => "sp",
+        SpNetwork::Testnet => "tsp",
+        SpNetwork::Regtest => {
+            return (
+                StatusCode::BAD_REQUEST,
+                AxumJson(RemoveResponse {
+                    id: request.id,
+                    message: "Can't remove regtest addresses".to_string(),
+                    dana_address: None,
+                    sp_address: None,
+                    dns_record_id: None,
+                }),
+            );
+        }
+    };
+    let signed_message = format!(
+        "dana-remove:{}:{}:{}:{}",
+        network_key, request.nonce, user_name, state.domain
+    );
+    if let Err(e) = verify_schnorr_signature(&request.signature, &signed_message, &sp_address) {
+        warn!(
+            "Signature verification failed for user '{}': {}",
+            user_name, e
+        );
+        return (
+            StatusCode::BAD_REQUEST,
+            AxumJson(RemoveResponse {
+                id: request.id,
+                message: format!("Invalid signature: {}", e),
+                dana_address: None,
+                sp_address: None,
+                dns_record_id: None,
+            }),
+        );
+    }
+
+    // Ownership check: only the current owner may remove.
+    let record_id = match remove_ownership_ok(&user_name, &sp_address, &state).await {
+        Ok(record_id) => record_id,
+        Err(RemoveOwnershipError::NotFound(msg)) => {
+            return (
+                StatusCode::NOT_FOUND,
+                AxumJson(RemoveResponse {
+                    id: request.id,
+                    message: msg,
+                    dana_address: None,
+                    sp_address: None,
+                    dns_record_id: None,
+                }),
+            );
+        }
+        Err(RemoveOwnershipError::Forbidden(msg)) => {
+            return (
+                StatusCode::FORBIDDEN,
+                AxumJson(RemoveResponse {
+                    id: request.id,
+                    message: msg,
+                    dana_address: None,
+                    sp_address: None,
+                    dns_record_id: None,
+                }),
+            );
+        }
+        Err(RemoveOwnershipError::Internal(msg)) => {
+            error!("Remove ownership check failed: {}", msg);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                AxumJson(RemoveResponse {
+                    id: request.id,
+                    message: "Internal server error, please try again later".to_string(),
+                    dana_address: None,
+                    sp_address: None,
+                    dns_record_id: None,
+                }),
+            );
+        }
+    };
+
+    // Delete the Cloudflare TXT record.
+    let client = Client::new();
+    if let Err(e) = delete_txt_record(&client, &state.zone_id, &state.api_token, &record_id).await {
+        error!("Failed to delete TXT record {}: {}", record_id, e);
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            AxumJson(RemoveResponse {
+                id: request.id,
+                message: "Failed to delete DNS record".to_string(),
+                dana_address: None,
+                sp_address: None,
+                dns_record_id: None,
+            }),
+        );
+    }
+
+    // Update the in-memory maps: remove the dana_address from sp_to_dana and dana_to_sp.
+    let dana_address = format!("{}@{}", user_name, state.domain);
+    {
+        let mut sp_map = state.sp_to_dana.write().await;
+        if let Some(entries) = sp_map.get_mut(&sp_address) {
+            entries.retain(|addr| addr != &dana_address);
+            if entries.is_empty() {
+                sp_map.remove(&sp_address);
+            }
+        }
+        let mut dana_map = state.dana_to_sp.write().await;
+        dana_map.remove(&dana_address);
+    }
+
+    info!("Removed Dana mapping {} (SP {})", dana_address, sp_address);
+
+    (
+        StatusCode::OK,
+        AxumJson(RemoveResponse {
+            id: request.id,
+            message: "Successfully removed Dana address".to_string(),
+            dana_address: Some(dana_address),
+            sp_address: Some(sp_address.to_string()),
+            dns_record_id: Some(record_id),
+        }),
+    )
 }
 
 #[cfg(test)]
@@ -1394,6 +1902,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_delete_txt_record_mock_success() {
+        let _guard = CF_ENV_LOCK.lock().unwrap();
+        let m = MockServer::start().await;
+        let zone = "testzone123";
+        let token = "test-token";
+        let record_id = "rec-abc-123";
+
+        Mock::given(method("DELETE"))
+            .and(path(format!("/zones/{}/dns_records/{}", zone, record_id)))
+            .and(header("Authorization", format!("Bearer {}", token)))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(&serde_json::json!({
+                    "success": true,
+                })),
+            )
+            .expect(1)
+            .mount(&m)
+            .await;
+
+        unsafe { std::env::set_var("CLOUDFLARE_API_BASE_URL", m.uri()) };
+        let client = Client::new();
+        let got = delete_txt_record(&client, zone, token, record_id).await.unwrap();
+        unsafe { std::env::remove_var("CLOUDFLARE_API_BASE_URL") };
+
+        assert_eq!(got, ());
+    }
+
+    #[tokio::test]
     async fn test_create_txt_record_mock_no_id() {
         let _guard = CF_ENV_LOCK.lock().unwrap();
         let m = MockServer::start().await;
@@ -1559,4 +2095,92 @@ async fn test_nonce_claim_rejects_mismatch_and_expired() {
     let expired = super::claim_nonce(&store, "n2", "alice", "sp1alice", "test.com").await;
     assert!(expired.is_err());
 }
+
+    // ── Remove endpoint tests ──
+
+    fn test_state() -> Arc<AppState> {
+        Arc::new(AppState {
+            zone_id: "zone".to_string(),
+            api_token: "token".to_string(),
+            domain: "danawallet.app".to_string(),
+            sp_to_dana: Arc::new(RwLock::new(HashMap::new())),
+            dana_to_sp: Arc::new(RwLock::new(HashMap::new())),
+            network: SpNetwork::Mainnet,
+            nonce_store: Arc::new(RwLock::new(HashMap::new())),
+            register_create_lock: Arc::new(tokio::sync::Mutex::new(())),
+        })
+    }
+
+    const TEST_SP: &str = "sp1qq0cygnetgn3rz2kla5cp05nj5uetlsrzez0l4p8g7wehf7ldr93lcqadw65upymwzvp5ed38l8ur2rznd6934xh95msevwrdwtrpk372hyz4vr6g";
+
+    #[tokio::test]
+    async fn test_remove_prepare_returns_nonce() {
+        let state = test_state();
+        let req = RemovePrepareRequest {
+            id: "id1".to_string(),
+            domain: "danawallet.app".to_string(),
+            user_name: Some("alice".to_string()),
+            sp_address: TEST_SP.to_string(),
+        };
+        let (status, AxumJson(resp)) = handle_remove_prepare(State(state), Json(req)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(resp.nonce.is_some());
+        assert!(resp.error.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_remove_prepare_rejects_bad_domain() {
+        let state = test_state();
+        let req = RemovePrepareRequest {
+            id: "id2".to_string(),
+            domain: "wrong.example".to_string(),
+            user_name: Some("alice".to_string()),
+            sp_address: TEST_SP.to_string(),
+        };
+        let (status, AxumJson(resp)) = handle_remove_prepare(State(state), Json(req)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(resp.nonce.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_remove_rejects_unclaimed_nonce() {
+        let state = test_state();
+        let req = RemoveRequest {
+            id: "id3".to_string(),
+            domain: "danawallet.app".to_string(),
+            user_name: Some("alice".to_string()),
+            sp_address: TEST_SP.to_string(),
+            signature: "deadbeef".to_string(),
+            nonce: "missing".to_string(),
+        };
+        let (status, AxumJson(resp)) = handle_remove(State(state), Json(req)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(resp.dns_record_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_remove_rejects_invalid_signature() {
+        let state = test_state();
+        // Claim a valid nonce so the handler proceeds past the nonce check.
+        state.nonce_store.write().await.insert(
+            "n1".to_string(),
+            super::NonceEntry {
+                user_name: "alice".into(),
+                sp_address: TEST_SP.into(),
+                domain: "danawallet.app".into(),
+                expires_at: std::time::Instant::now() + std::time::Duration::from_secs(300),
+            },
+        );
+        let req = RemoveRequest {
+            id: "id4".to_string(),
+            domain: "danawallet.app".to_string(),
+            user_name: Some("alice".to_string()),
+            sp_address: TEST_SP.to_string(),
+            signature: "deadbeef".to_string(),
+            nonce: "n1".to_string(),
+        };
+        let (status, AxumJson(resp)) = handle_remove(State(state), Json(req)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(resp.dns_record_id.is_none());
+    }
 }
