@@ -1660,4 +1660,325 @@ mod tests {
         assert!(!store.contains_key("expired"));
     }
 
+
+    // ── Integrated /register challenge-response tests ──
+    // These drive the full handle_register handler, exercising the
+    // challenge-response enforcement (missing/invalid signature, expired or
+    // single-use nonce) plus the happy path (valid signature + valid nonce).
+
+    // Helper: a nonce entry bound to the given user_name / sp_address / domain.
+    async fn make_nonce(
+        store: &Arc<RwLock<HashMap<String, NonceEntry>>>,
+        nonce: &str,
+        user_name: &str,
+        sp_address: &str,
+        domain: &str,
+        expires_at: Instant,
+    ) {
+        store.write().await.insert(
+            nonce.to_string(),
+            NonceEntry {
+                user_name: user_name.to_string(),
+                sp_address: sp_address.to_string(),
+                domain: domain.to_string(),
+                expires_at,
+            },
+        );
+    }
+
+    // Helper: build an AppState with the challenge-response plumbing wired up.
+    fn register_state(domain: &str) -> AppState {
+        AppState {
+            zone_id: "zone-test".to_string(),
+            api_token: "token-test".to_string(),
+            domain: domain.to_string(),
+            sp_to_dana: Arc::new(RwLock::new(HashMap::new())),
+            dana_to_sp: Arc::new(RwLock::new(HashMap::new())),
+            network: SpNetwork::Mainnet,
+            nonce_store: Arc::new(RwLock::new(HashMap::new())),
+            peer_nonce_counts: Arc::new(RwLock::new(HashMap::new())),
+            outstanding_nonces: Arc::new(AtomicU64::new(0)),
+            max_pending_nonces: 100,
+            max_nonces_per_peer: 10,
+        }
+    }
+
+    // Helper: Schnorr-sign the challenge message for a spend secret key.
+    fn sign_challenge(
+        secp: &secp256k1::Secp256k1<secp256k1::All>,
+        spend_secret: &secp256k1::SecretKey,
+        network_key: &str,
+        nonce: &str,
+    ) -> String {
+        use secp256k1::{Keypair, Message};
+        use sha2::{Digest, Sha256};
+        use rand::thread_rng;
+
+        let message = format!("dana:v1:challenge:{}:{}", network_key, nonce);
+        let digest = Sha256::digest(message.as_bytes());
+        let msg = Message::from_digest_slice(&digest).unwrap();
+        let keypair = Keypair::from_seckey_slice(secp, &spend_secret.secret_bytes()).unwrap();
+        let sig = secp.sign_schnorr_with_rng(&msg, &keypair, &mut thread_rng());
+        hex::encode(sig.serialize())
+    }
+
+    #[tokio::test]
+    async fn test_register_missing_signature_rejected() {
+        let secp = secp256k1::Secp256k1::new();
+        let scan_secret = secp256k1::SecretKey::new(&mut rand::thread_rng());
+        let spend_secret = secp256k1::SecretKey::new(&mut rand::thread_rng());
+        let sp_addr = make_sp_address(&secp, &scan_secret, &spend_secret);
+        let domain = "danawallet.app";
+        let nonce = "nonce-missing-sig";
+
+        let state = register_state(domain);
+        make_nonce(
+            &state.nonce_store,
+            nonce,
+            "alice",
+            &sp_addr.to_string(),
+            domain,
+            Instant::now() + Duration::from_secs(60),
+        ).await;
+
+        let resp = handle_register(
+            State(Arc::new(state)),
+            Json(RegisterRequest {
+                id: "req1".to_string(),
+                domain: domain.to_string(),
+                user_name: Some("alice".to_string()),
+                sp_address: sp_addr.to_string(),
+                nonce: Some(nonce.to_string()),
+                signature: None, // missing signature
+            }),
+        )
+        .await;
+
+        assert_eq!(resp.0, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_register_missing_nonce_rejected() {
+        let secp = secp256k1::Secp256k1::new();
+        let scan_secret = secp256k1::SecretKey::new(&mut rand::thread_rng());
+        let spend_secret = secp256k1::SecretKey::new(&mut rand::thread_rng());
+        let sp_addr = make_sp_address(&secp, &scan_secret, &spend_secret);
+        let domain = "danawallet.app";
+
+        let state = register_state(domain);
+
+        let resp = handle_register(
+            State(Arc::new(state)),
+            Json(RegisterRequest {
+                id: "req1".to_string(),
+                domain: domain.to_string(),
+                user_name: Some("alice".to_string()),
+                sp_address: sp_addr.to_string(),
+                nonce: None, // missing nonce
+                signature: Some("00".repeat(64)),
+            }),
+        )
+        .await;
+
+        assert_eq!(resp.0, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_register_invalid_signature_rejected() {
+        let secp = secp256k1::Secp256k1::new();
+        let scan_secret = secp256k1::SecretKey::new(&mut rand::thread_rng());
+        let spend_secret = secp256k1::SecretKey::new(&mut rand::thread_rng());
+        let sp_addr = make_sp_address(&secp, &scan_secret, &spend_secret);
+        let domain = "danawallet.app";
+        let nonce = "nonce-bad-sig";
+
+        let state = register_state(domain);
+        make_nonce(
+            &state.nonce_store,
+            nonce,
+            "alice",
+            &sp_addr.to_string(),
+            domain,
+            Instant::now() + Duration::from_secs(60),
+        ).await;
+
+        // Signature over a *different* nonce/message => verification must fail.
+        let bad_sig = sign_challenge(&secp, &spend_secret, "sp", "wrong-nonce");
+
+        let resp = handle_register(
+            State(Arc::new(state)),
+            Json(RegisterRequest {
+                id: "req1".to_string(),
+                domain: domain.to_string(),
+                user_name: Some("alice".to_string()),
+                sp_address: sp_addr.to_string(),
+                nonce: Some(nonce.to_string()),
+                signature: Some(bad_sig),
+            }),
+        )
+        .await;
+
+        assert_eq!(resp.0, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_register_expired_nonce_rejected() {
+        let secp = secp256k1::Secp256k1::new();
+        let scan_secret = secp256k1::SecretKey::new(&mut rand::thread_rng());
+        let spend_secret = secp256k1::SecretKey::new(&mut rand::thread_rng());
+        let sp_addr = make_sp_address(&secp, &scan_secret, &spend_secret);
+        let domain = "danawallet.app";
+        let nonce = "nonce-expired";
+        let sig = sign_challenge(&secp, &spend_secret, "sp", nonce);
+
+        let state = register_state(domain);
+        // Nonce already expired.
+        make_nonce(
+            &state.nonce_store,
+            nonce,
+            "alice",
+            &sp_addr.to_string(),
+            domain,
+            Instant::now() - Duration::from_secs(10),
+        ).await;
+
+        let resp = handle_register(
+            State(Arc::new(state)),
+            Json(RegisterRequest {
+                id: "req1".to_string(),
+                domain: domain.to_string(),
+                user_name: Some("alice".to_string()),
+                sp_address: sp_addr.to_string(),
+                nonce: Some(nonce.to_string()),
+                signature: Some(sig),
+            }),
+        )
+        .await;
+
+        assert_eq!(resp.0, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_register_reused_nonce_rejected() {
+        let secp = secp256k1::Secp256k1::new();
+        let scan_secret = secp256k1::SecretKey::new(&mut rand::thread_rng());
+        let spend_secret = secp256k1::SecretKey::new(&mut rand::thread_rng());
+        let sp_addr = make_sp_address(&secp, &scan_secret, &spend_secret);
+        let domain = "danawallet.app";
+        let nonce = "nonce-reuse";
+        let sig = sign_challenge(&secp, &spend_secret, "sp", nonce);
+
+        let state = register_state(domain);
+        make_nonce(
+            &state.nonce_store,
+            nonce,
+            "alice",
+            &sp_addr.to_string(),
+            domain,
+            Instant::now() + Duration::from_secs(60),
+        ).await;
+
+        // First call: valid signature + valid nonce, but we force an early
+        // non-401 outcome by pointing Cloudflare at a wiremock that fails, so
+        // the nonce is still *claimed* (consumed) during this first attempt.
+        // The important part is that the nonce is single-use: a second call
+        // with the same nonce must be rejected regardless of signature.
+        let m = wiremock::MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/zones/zone-test/dns_records"))
+            .respond_with(wiremock::ResponseTemplate::new(500))
+            .mount(&m)
+            .await;
+        unsafe { std::env::set_var("CLOUDFLARE_API_BASE_URL", m.uri()); }
+
+        let first = handle_register(
+            State(Arc::new(state.clone())),
+            Json(RegisterRequest {
+                id: "req1".to_string(),
+                domain: domain.to_string(),
+                user_name: Some("alice".to_string()),
+                sp_address: sp_addr.to_string(),
+                nonce: Some(nonce.to_string()),
+                signature: Some(sig.clone()),
+            }),
+        )
+        .await;
+
+        // Second attempt with the *same* single-use nonce must be rejected.
+        let resp = handle_register(
+            State(Arc::new(state.clone())),
+            Json(RegisterRequest {
+                id: "req2".to_string(),
+                domain: domain.to_string(),
+                user_name: Some("alice".to_string()),
+                sp_address: sp_addr.to_string(),
+                nonce: Some(nonce.to_string()),
+                signature: Some(sig),
+            }),
+        )
+        .await;
+
+        unsafe { std::env::remove_var("CLOUDFLARE_API_BASE_URL"); }
+        // Regardless of what the first call returned, the reused nonce must 401.
+        assert_eq!(resp.0, StatusCode::UNAUTHORIZED);
+        let _ = first;
+    }
+
+    #[tokio::test]
+    async fn test_register_valid_signature_success() {
+        let secp = secp256k1::Secp256k1::new();
+        let scan_secret = secp256k1::SecretKey::new(&mut rand::thread_rng());
+        let spend_secret = secp256k1::SecretKey::new(&mut rand::thread_rng());
+        let sp_addr = make_sp_address(&secp, &scan_secret, &spend_secret);
+        let domain = "danawallet.app";
+        let nonce = "nonce-good";
+        let sig = sign_challenge(&secp, &spend_secret, "sp", nonce);
+        // Use a name almost certain to have no DNS record yet, so the DNS
+        // existence check returns Ok(None) and registration proceeds.
+        let user_name = format!("dana_test_user_{}", rand::random::<u64>());
+
+        let m = wiremock::MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/zones/zone-test/dns_records"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(&serde_json::json!({
+                        "success": true,
+                        "result": { "id": "rec-xyz" },
+                    })),
+            )
+            .expect(1)
+            .mount(&m)
+            .await;
+        unsafe { std::env::set_var("CLOUDFLARE_API_BASE_URL", m.uri()); }
+
+        let state = register_state(domain);
+        make_nonce(
+            &state.nonce_store,
+            nonce,
+            &user_name,
+            &sp_addr.to_string(),
+            domain,
+            Instant::now() + Duration::from_secs(60),
+        ).await;
+
+        let resp = handle_register(
+            State(Arc::new(state)),
+            Json(RegisterRequest {
+                id: "req1".to_string(),
+                domain: domain.to_string(),
+                user_name: Some(user_name.clone()),
+                sp_address: sp_addr.to_string(),
+                nonce: Some(nonce.to_string()),
+                signature: Some(sig),
+            }),
+        )
+        .await;
+
+        unsafe { std::env::remove_var("CLOUDFLARE_API_BASE_URL"); }
+        // Valid signature + valid nonce must pass challenge-response: any
+        // outcome other than UNAUTHORIZED proves the enforcement accepted it.
+        assert_ne!(resp.0, StatusCode::UNAUTHORIZED);
+    }
+
 }
