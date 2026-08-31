@@ -1860,6 +1860,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_register_reused_nonce_rejected() {
+        let _guard = CF_ENV_LOCK.lock().unwrap();
         let secp = secp256k1::Secp256k1::new();
         let scan_secret = secp256k1::SecretKey::new(&mut rand::thread_rng());
         let spend_secret = secp256k1::SecretKey::new(&mut rand::thread_rng());
@@ -1926,6 +1927,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_register_valid_signature_success() {
+        let _guard = CF_ENV_LOCK.lock().unwrap();
         let secp = secp256k1::Secp256k1::new();
         let scan_secret = secp256k1::SecretKey::new(&mut rand::thread_rng());
         let spend_secret = secp256k1::SecretKey::new(&mut rand::thread_rng());
