@@ -8,6 +8,11 @@ pub struct RegisterRequest {
     pub domain: String,
     pub user_name: Option<String>,
     pub sp_address: String,
+    // Challenge-response auth (branch challenge-auth): the client must present
+    // the nonce issued by /challenge plus a Schnorr signature over the
+    // challenge message, signed with the spend private key of sp_address.
+    pub nonce: Option<String>,
+    pub signature: Option<String>,
 }
 
 #[derive(Serialize)]

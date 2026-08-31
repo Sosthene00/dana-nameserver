@@ -602,8 +602,6 @@ async fn handle_register(
         }
     };
 
-    // TODO verify a signature over some message that user must provides with the request
-
     // if user_name is empty, we generate a random one
     let user_name = match request.user_name {
         Some(user_name) => user_name,
@@ -620,6 +618,95 @@ async fn handle_register(
             );
         }
     };
+
+    // ── Challenge-response enforcement ──
+    // Refuse any DNS mutation unless the client presents a valid nonce issued
+    // by /challenge AND a Schnorr signature over the challenge message
+    // (dana:v1:challenge:{network_key}:{nonce}) signed with the spend private
+    // key that derives the claimed SP address.
+    let nonce = match request.nonce {
+        Some(nonce) => nonce,
+        None => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                AxumJson(RegisterResponse {
+                    id: request.id.clone(),
+                    message: "Missing nonce: call /challenge first to obtain a challenge nonce"
+                        .to_string(),
+                    dana_address: None,
+                    sp_address: None,
+                    dns_record_id: None,
+                }),
+            );
+        }
+    };
+    let signature = match request.signature {
+        Some(signature) => signature,
+        None => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                AxumJson(RegisterResponse {
+                    id: request.id.clone(),
+                    message: "Missing signature: sign the challenge message with the spend private key"
+                        .to_string(),
+                    dana_address: None,
+                    sp_address: None,
+                    dns_record_id: None,
+                }),
+            );
+        }
+    };
+
+    // Claim the single-use nonce: it must exist, not be expired, and match this
+    // request's user_name / SP address / domain.
+    match claim_nonce(
+        &state.nonce_store,
+        &state.outstanding_nonces,
+        &nonce,
+        &user_name,
+        &sp_address.to_string(),
+        &state.domain,
+    )
+    .await
+    {
+        Ok(()) => {}
+        Err(e) => {
+            error!("Nonce claim failed for user {}: {}", user_name, e);
+            return (
+                StatusCode::UNAUTHORIZED,
+                AxumJson(RegisterResponse {
+                    id: request.id.clone(),
+                    message: e,
+                    dana_address: None,
+                    sp_address: None,
+                    dns_record_id: None,
+                }),
+            );
+        }
+    }
+
+    // Verify the Schnorr signature over the challenge message for this nonce.
+    let message = format!("dana:v1:challenge:{}:{}", network_key, nonce);
+    if let Err(e) = verify_schnorr_signature(&signature, &message, &sp_address) {
+        error!(
+            "Signature verification failed for user {} on {}: {}",
+            user_name, state.domain, e
+        );
+        return (
+            StatusCode::UNAUTHORIZED,
+            AxumJson(RegisterResponse {
+                id: request.id.clone(),
+                message: e,
+                dana_address: None,
+                sp_address: None,
+                dns_record_id: None,
+            }),
+        );
+    }
+    info!(
+        "Challenge-response verified for {}@{} (nonce {})",
+        user_name, state.domain, nonce
+    );
 
     let dana_address = format!("{}@{}", user_name, state.domain);
     let txt_name = format!("{}.user._bitcoin-payment.{}", user_name, state.domain);
