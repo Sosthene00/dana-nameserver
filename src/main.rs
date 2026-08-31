@@ -347,7 +347,9 @@ async fn claim_nonce(
     if entry.user_name != user_name || entry.sp_address != sp_address || entry.domain != domain {
         return Err("Nonce does not match this request. Request a new one.".to_string());
     }
-    store.remove(nonce).expect("validated nonce is present");
+    if store.remove(nonce).is_none() {
+        return Err("Nonce already consumed or raced. Request a fresh challenge.".to_string());
+    }
     drop(store);
     outstanding_nonces.fetch_sub(1, Ordering::SeqCst);
     Ok(())
