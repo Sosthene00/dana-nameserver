@@ -1705,12 +1705,12 @@ mod tests {
 
     // Helper: Schnorr-sign the challenge message for a spend secret key.
     fn sign_challenge(
-        secp: &secp256k1::Secp256k1<secp256k1::All>,
-        spend_secret: &secp256k1::SecretKey,
+        secp: &silentpayments::secp256k1::Secp256k1<silentpayments::secp256k1::All>,
+        spend_secret: &silentpayments::secp256k1::SecretKey,
         network_key: &str,
         nonce: &str,
     ) -> String {
-        use secp256k1::{Keypair, Message};
+        use silentpayments::secp256k1::{Keypair, Message};
         use sha2::{Digest, Sha256};
         use rand::thread_rng;
 
@@ -1724,9 +1724,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_register_missing_signature_rejected() {
-        let secp = secp256k1::Secp256k1::new();
-        let scan_secret = secp256k1::SecretKey::new(&mut rand::thread_rng());
-        let spend_secret = secp256k1::SecretKey::new(&mut rand::thread_rng());
+        let secp = silentpayments::secp256k1::Secp256k1::new();
+        let scan_secret = silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
+        let spend_secret = silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
         let sp_addr = make_sp_address(&secp, &scan_secret, &spend_secret);
         let domain = "danawallet.app";
         let nonce = "nonce-missing-sig";
@@ -1759,9 +1759,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_register_missing_nonce_rejected() {
-        let secp = secp256k1::Secp256k1::new();
-        let scan_secret = secp256k1::SecretKey::new(&mut rand::thread_rng());
-        let spend_secret = secp256k1::SecretKey::new(&mut rand::thread_rng());
+        let secp = silentpayments::secp256k1::Secp256k1::new();
+        let scan_secret = silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
+        let spend_secret = silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
         let sp_addr = make_sp_address(&secp, &scan_secret, &spend_secret);
         let domain = "danawallet.app";
 
@@ -1785,9 +1785,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_register_invalid_signature_rejected() {
-        let secp = secp256k1::Secp256k1::new();
-        let scan_secret = secp256k1::SecretKey::new(&mut rand::thread_rng());
-        let spend_secret = secp256k1::SecretKey::new(&mut rand::thread_rng());
+        let secp = silentpayments::secp256k1::Secp256k1::new();
+        let scan_secret = silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
+        let spend_secret = silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
         let sp_addr = make_sp_address(&secp, &scan_secret, &spend_secret);
         let domain = "danawallet.app";
         let nonce = "nonce-bad-sig";
@@ -1823,9 +1823,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_register_expired_nonce_rejected() {
-        let secp = secp256k1::Secp256k1::new();
-        let scan_secret = secp256k1::SecretKey::new(&mut rand::thread_rng());
-        let spend_secret = secp256k1::SecretKey::new(&mut rand::thread_rng());
+        let secp = silentpayments::secp256k1::Secp256k1::new();
+        let scan_secret = silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
+        let spend_secret = silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
         let sp_addr = make_sp_address(&secp, &scan_secret, &spend_secret);
         let domain = "danawallet.app";
         let nonce = "nonce-expired";
@@ -1861,9 +1861,9 @@ mod tests {
     #[tokio::test]
     async fn test_register_reused_nonce_rejected() {
         let _guard = CF_ENV_LOCK.lock().unwrap();
-        let secp = secp256k1::Secp256k1::new();
-        let scan_secret = secp256k1::SecretKey::new(&mut rand::thread_rng());
-        let spend_secret = secp256k1::SecretKey::new(&mut rand::thread_rng());
+        let secp = silentpayments::secp256k1::Secp256k1::new();
+        let scan_secret = silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
+        let spend_secret = silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
         let sp_addr = make_sp_address(&secp, &scan_secret, &spend_secret);
         let domain = "danawallet.app";
         let nonce = "nonce-reuse";
@@ -1928,9 +1928,9 @@ mod tests {
     #[tokio::test]
     async fn test_register_valid_signature_success() {
         let _guard = CF_ENV_LOCK.lock().unwrap();
-        let secp = secp256k1::Secp256k1::new();
-        let scan_secret = secp256k1::SecretKey::new(&mut rand::thread_rng());
-        let spend_secret = secp256k1::SecretKey::new(&mut rand::thread_rng());
+        let secp = silentpayments::secp256k1::Secp256k1::new();
+        let scan_secret = silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
+        let spend_secret = silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
         let sp_addr = make_sp_address(&secp, &scan_secret, &spend_secret);
         let domain = "danawallet.app";
         let nonce = "nonce-good";
