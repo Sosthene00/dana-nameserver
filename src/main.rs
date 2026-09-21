@@ -304,7 +304,7 @@ async fn handle_challenge(
         StatusCode::OK,
         AxumJson(ChallengeResponse {
             id: request.id,
-            message: format!("dana:v1:challenge:{}:{}", network_key, nonce),
+            message: challenge_message(network_key, &nonce, &request.user_name, &request.domain),
             nonce,
             network_key: network_key.to_string(),
             expires_at,
@@ -358,7 +358,7 @@ async fn claim_nonce(
     user_name: &str,
     sp_address: &str,
     domain: &str,
-) -> Result<(), String> {
+) -> Result<NonceEntry, String> {
     let mut store = nonce_store.write().await;
     let entry = match store.get(nonce) {
         Some(entry) => entry,
@@ -372,10 +372,11 @@ async fn claim_nonce(
     if entry.user_name != user_name || entry.sp_address != sp_address || entry.domain != domain {
         return Err("Nonce does not match this request. Request a new one.".to_string());
     }
-    if store.remove(nonce).is_none() {
-        return Err("Nonce already consumed or raced. Request a fresh challenge.".to_string());
-    }
-    Ok(())
+    let claimed = store.remove(nonce).ok_or_else(|| {
+        "Nonce already consumed or raced. Request a fresh challenge.".to_string()
+    })?;
+    drop(store);
+    Ok(claimed)
 }
 
 /// Decrement a peer's outstanding-nonce counter, removing the key once it
@@ -398,6 +399,13 @@ async fn release_peer_nonce_slot(
     let mut counts = peer_nonce_counts.write().await;
     decrement_peer_count(&mut counts, peer);
 }
+
+/// Single source of truth for the message a client must sign: the literal prefix
+/// `dana-register` followed by the colon-separated fields network_key, nonce,
+/// user_name, domain, in that order.
+    fn challenge_message(network_key: &str, nonce: &str, user_name: &str, domain: &str) -> String {
+        format!("dana-register:{}:{}:{}:{}", network_key, nonce, user_name, domain)
+    }
 
 /// Remove expired nonce entries to bound the in-memory store, and decrement /
 /// prune the per-peer counters for exactly the entries dropped in this pass.
@@ -725,7 +733,7 @@ async fn handle_register(
 
     // Claim the single-use nonce: it must exist, not be expired, and match this
     // request's user_name / SP address / domain.
-    match claim_nonce(
+    let claimed = match claim_nonce(
         &state.nonce_store,
         &nonce,
         &user_name,
@@ -734,11 +742,12 @@ async fn handle_register(
     )
     .await
     {
-        Ok(()) => {
+        Ok(claimed) => {
             // The nonce is consumed: free this peer's rate-limit slot and drop the
             // key at zero so completed challenge-register cycles cannot pin entries
             // in peer_nonce_counts forever.
             release_peer_nonce_slot(&state.peer_nonce_counts, &sp_address.to_string()).await;
+            claimed
         }
         Err(e) => {
             error!("Nonce claim failed for user {}: {}", user_name, e);
@@ -753,10 +762,12 @@ async fn handle_register(
                 }),
             );
         }
-    }
+    };
 
     // Verify the Schnorr signature over the challenge message for this nonce.
-    let message = format!("dana:v1:challenge:{}:{}", network_key, nonce);
+    // The bindings below come from the CLAIMED entry, so they are exactly the
+    // values claim_nonce just validated against this request.
+    let message = challenge_message(network_key, &nonce, &claimed.user_name, &claimed.domain);
     if let Err(e) = verify_schnorr_signature(&signature, &message, &sp_address) {
         error!(
             "Signature verification failed for user {} on {}: {}",
