@@ -103,10 +103,13 @@ fn validate_dns_name(name: &str) -> bool {
     name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
 }
 
-/// Challenge endpoint: issue a single-use nonce bound to the user_name / SP
-/// address / domain. The client signs the returned message with the spend
-/// private key; a later register/remove request supplies signature + nonce so
-/// the server can verify ownership of the SP address.
+/// Issue a single-use nonce for the challenge-response handshake and state the
+/// exact message the client is expected to sign: the literal prefix
+/// `dana-register` followed by the colon-separated fields network_key, nonce,
+/// user_name, domain, in that order - `dana-register:{network_key}:{nonce}:{user_name}:{domain}`.
+/// Assemble it with `challenge_message`, the single source of truth, and sign it
+/// with the spend secret key whose public key derives the claimed SP address; the
+/// resulting Schnorr signature is echoed back on the register request to be verified.
 async fn handle_challenge(
     State(state): State<Arc<AppState>>,
     Json(request): Json<ChallengeRequest>,
@@ -696,7 +699,7 @@ async fn handle_register(
     // ── Challenge-response enforcement ──
     // Refuse any DNS mutation unless the client presents a valid nonce issued
     // by /challenge AND a Schnorr signature over the challenge message
-    // (dana:v1:challenge:{network_key}:{nonce}) signed with the spend private
+    // (dana-register:{network_key}:{nonce}:{user_name}:{domain}) signed with the spend private
     // key that derives the claimed SP address.
     let nonce = match request.nonce {
         Some(nonce) => nonce,
