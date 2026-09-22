@@ -1574,6 +1574,7 @@ async fn main() {
     info!("Server starting on {server_addr}");
     info!("API endpoint available at: http://{server_addr}/v1/info");
     info!("API endpoint available at: http://{server_addr}/v1/register");
+    info!("API endpoint available at: http://{server_addr}/v1/challenge");
     info!("API endpoint available at: http://{server_addr}/v1/lookup");
     info!("API endpoint available at: http://{server_addr}/v1/search");
 
