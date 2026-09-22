@@ -2632,6 +2632,78 @@ mod tests {
         let _ = first;
     }
 
+#[tokio::test]
+    async fn test_register_wrong_signature_does_not_burn_nonce() {
+        let _guard = CF_ENV_LOCK.lock().unwrap();
+        let secp = silentpayments::secp256k1::Secp256k1::new();
+        let scan_secret = silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
+        let spend_secret = silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
+        let sp_addr = make_sp_address(&secp, &scan_secret, &spend_secret);
+        let domain = "danawallet.app";
+        let nonce = "nonce-bad-then-good";
+                // Use a name almost certain to have no DNS record yet, so the DNS
+        // existence check returns Ok(None) and registration proceeds.
+        let user_name = format!("dana-test-user-{}", rand::random::<u64>());
+        let good_sig = sign_challenge(&secp, &spend_secret, "sp", nonce, &user_name, domain);
+        let bad_sig = sign_challenge(&secp, &spend_secret, "sp-bogus", nonce, &user_name, domain);
+
+        let m = wiremock::MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/zones/zone-test/dns_records"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(&serde_json::json!({
+                        "success": true,
+                        "result": { "id": "rec-xyz" },
+                    })),
+            )
+            .expect(1)
+            .mount(&m)
+            .await;
+        unsafe { std::env::set_var("CLOUDFLARE_API_BASE_URL", m.uri()); }
+
+        let state = register_state(domain);
+        make_nonce(
+            &state.nonce_store,
+            nonce,
+            &user_name,
+            &sp_addr.to_string(),
+            domain,
+            Instant::now() + Duration::from_secs(60),
+        ).await;
+
+        let resp_bad = handle_register(
+            State(Arc::new(state.clone())),
+            Json(RegisterRequest {
+                id: "req-bad".to_string(),
+                domain: domain.to_string(),
+                user_name: Some(user_name.clone()),
+                sp_address: sp_addr.to_string(),
+                nonce: Some(nonce.to_string()),
+                signature: Some(bad_sig),
+            }),
+        )
+        .await;
+        assert_eq!(resp_bad.0, StatusCode::UNAUTHORIZED);
+let resp_good = handle_register(
+            State(Arc::new(state)),
+            Json(RegisterRequest {
+                id: "req-good".to_string(),
+                domain: domain.to_string(),
+                user_name: Some(user_name.clone()),
+                sp_address: sp_addr.to_string(),
+                nonce: Some(nonce.to_string()),
+                signature: Some(good_sig),
+            }),
+        )
+        .await;
+
+        unsafe { std::env::remove_var("CLOUDFLARE_API_BASE_URL"); }
+        // Valid signature + valid nonce must pass challenge-response: any
+        // outcome other than UNAUTHORIZED proves the enforcement accepted it.
+        assert_ne!(resp_good.0, StatusCode::UNAUTHORIZED);
+    }
+
     #[tokio::test]
     async fn test_register_valid_signature_success() {
         let _guard = CF_ENV_LOCK.lock().unwrap();
