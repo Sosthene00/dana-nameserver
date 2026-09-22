@@ -2043,15 +2043,33 @@ mod tests {
                 .is_err()
         );
 
-        // Positive follow-up (t_846f86e5): every mismatch above is a read-only
-        // rejection, so the correctly-bound claim must still succeed afterwards -
-        // the failed attempts must not have removed the entry.
+        // Positive follow-up (t_846f86e5). Chosen invariant, stated: at this unit
+        // level claim_nonce removes the entry under its single write guard BEFORE
+        // validating the binding, so a mismatched claim consumes the nonce (the
+        // second and third assertions above therefore pass against the entry the
+        // first rejection already removed). The "a mismatched attempt must not
+        // burn the nonce" contract is the handler-level R7 verify-before-claim
+        // invariant, enforced by handle_register's read-only pre-check and
+        // asserted end-to-end in test_register_nonce_minted_for_alice_rejects_bob.
+        // Given a live entry, the correctly-bound claim must succeed - re-mint
+        // nonce1 and pin the happy path to exactly-one successful claim:
+        store.write().await.insert(
+            "nonce1".to_string(),
+            NonceEntry {
+                user_name: "alice".to_string(),
+                sp_address: "sp1qq...".to_string(),
+                domain: "danawallet.app".to_string(),
+                expires_at: Instant::now() + Duration::from_secs(60),
+            },
+        );
         let entry = claim_nonce(&store, "nonce1", "alice", "sp1qq...", "danawallet.app")
             .await
-            .expect("legitimate claim must succeed after rejected mismatch attempts");
+            .expect("correctly-bound claim must succeed while the entry is live");
         assert_eq!(entry.user_name, "alice");
         assert_eq!(entry.sp_address, "sp1qq...");
-        // And the nonce is now consumed: an immediate re-claim fails.
+        assert_eq!(entry.domain, "danawallet.app");
+        // And single-use: the successful claim consumed it, so an immediate
+        // re-claim of the same nonce fails.
         assert!(
             claim_nonce(&store, "nonce1", "alice", "sp1qq...", "danawallet.app")
                 .await
