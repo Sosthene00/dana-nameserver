@@ -73,6 +73,9 @@ impl NonceEntry {
 
 #[derive(Clone)]
 struct AppState {
+    /// Shared secp256k1 context, constructed once at startup and reused by every
+    /// Schnorr verification on the request path (no per-request context allocation).
+    secp: silentpayments::secp256k1::Secp256k1<silentpayments::secp256k1::All>,
     zone_id: String,
     api_token: String,
     domain: String,
@@ -138,6 +141,11 @@ fn validate_dns_name(name: &str) -> bool {
 /// Assemble it with `challenge_message`, the single source of truth, and sign it
 /// with the spend secret key whose public key derives the claimed SP address; the
 /// resulting Schnorr signature is echoed back on the register request to be verified.
+///
+/// BIP-340 (mandatory): the Schnorr signature MUST be made over the SHA-256
+/// digest of the message string, never over its raw bytes - hash the exact
+/// `message` returned by this endpoint and sign the 32-byte digest with the
+/// spend secret key, or verification on `/register` will always fail.
 async fn handle_challenge(
     State(state): State<Arc<AppState>>,
     Json(request): Json<ChallengeRequest>,
@@ -353,12 +361,16 @@ async fn handle_challenge(
 /// nonce; the client may retry with a corrected signature until the TTL
 /// expires. Replay is prevented because claim_nonce removes the nonce only
 /// after successful verification.
+///
+/// The secp256k1 context is supplied by the caller as a shared, long-lived value
+/// (`AppState::secp`, constructed once at startup) - it is not rebuilt per request.
 fn verify_schnorr_signature(
+    secp: &silentpayments::secp256k1::Secp256k1<silentpayments::secp256k1::All>,
     signature_hex: &str,
     message: &str,
     sp_address: &SilentPaymentCode,
 ) -> Result<(), String> {
-    use silentpayments::secp256k1::{Message, Secp256k1, XOnlyPublicKey, schnorr::Signature};
+    use silentpayments::secp256k1::{Message, XOnlyPublicKey, schnorr::Signature};
 
     let sig_bytes = hex::decode(signature_hex).map_err(|e| format!("Invalid signature hex: {}", e))?;
     if sig_bytes.len() != 64 {
@@ -382,7 +394,6 @@ fn verify_schnorr_signature(
     let msg = Message::from_digest_slice(&digest)
         .map_err(|e| format!("Invalid digest: {}", e))?;
 
-    let secp = Secp256k1::new();
     secp.verify_schnorr(&sig, &msg, &x_only)
         .map_err(|e| format!("Signature verification failed: {}", e))
 }
@@ -889,7 +900,7 @@ async fn handle_register(
     // The bindings below come from the looked-up entry and match the request fields
     // checked by the read-only pre-check above; the claim below re-validates them.
     let message = challenge_message(network_key, &nonce, &entry.user_name, &entry.domain);
-    if let Err(e) = verify_schnorr_signature(&signature, &message, &sp_address) {
+    if let Err(e) = verify_schnorr_signature(&state.secp, &signature, &message, &sp_address) {
         warn!(
             "Signature verification failed for user {} on {}: {}",
             user_name, state.domain, e
@@ -1530,6 +1541,7 @@ async fn main() {
     }
 
     let state = Arc::new(AppState {
+        secp: silentpayments::secp256k1::Secp256k1::new(),
         zone_id,
         api_token,
         domain,
@@ -1938,7 +1950,7 @@ mod tests {
         let sig = secp.sign_schnorr_with_rng(&msg, &keypair, &mut thread_rng());
         let sig_hex = hex::encode(sig.serialize());
 
-        assert!(verify_schnorr_signature(&sig_hex, message, &sp_addr).is_ok());
+        assert!(verify_schnorr_signature(&secp, &sig_hex, message, &sp_addr).is_ok());
     }
 
     #[test]
@@ -1962,10 +1974,10 @@ mod tests {
         let sig = secp.sign_schnorr_with_rng(&msg, &keypair, &mut thread_rng());
         let sig_hex = hex::encode(sig.serialize());
 
-        assert!(verify_schnorr_signature(&sig_hex, message, &sp_addr).is_err());
+        assert!(verify_schnorr_signature(&secp, &sig_hex, message, &sp_addr).is_err());
 
         // Also reject a malformed / wrong-length signature
-        assert!(verify_schnorr_signature("deadbeef", message, &sp_addr).is_err());
+        assert!(verify_schnorr_signature(&secp, "deadbeef", message, &sp_addr).is_err());
     }
 
     // ── Challenge-auth (branch 1): nonce claim + expiry ──
@@ -2280,6 +2292,7 @@ mod tests {
     // Helper: build an AppState with the challenge-response plumbing wired up.
     fn register_state(domain: &str) -> AppState {
         AppState {
+            secp: silentpayments::secp256k1::Secp256k1::new(),
             zone_id: "zone-test".to_string(),
             api_token: "token-test".to_string(),
             domain: domain.to_string(),

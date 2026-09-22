@@ -115,6 +115,12 @@ pub struct ChallengeRequest {
 #[derive(Serialize)]
 pub struct ChallengeResponse {
     pub id: String,
+    /// The exact string the client must sign, as returned by `/challenge`
+    /// (`dana-register:{network_key}:{nonce}:{user_name}:{domain}`).
+    /// Per BIP-340 the client MUST sign SHA-256(message) with the spend secret
+    /// key - never the raw message preimage; the server verifies against
+    /// `Message::from_digest_slice(Sha256::digest(message))`, so a signature
+    /// over the unhashed string is always rejected.
     pub message: String,
     pub nonce: String,
     pub network_key: String,
