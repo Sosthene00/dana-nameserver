@@ -49,7 +49,14 @@ const MAX_TRACKED_PEERS: usize = 1_000;
 const MAX_TRACKED_NAMES: usize = 10_000;
 
 /// A nonce issued by the challenge endpoint. Bound to the user_name / SP
-/// address / domain it was minted for so a later claim must match all three.
+/// address / domain at mint time. The entry stays in the store until
+/// signature verification succeeds: a failed signature verification does
+/// NOT consume the nonce, so the client may retry with a corrected
+/// signature until the TTL expires. Replay is prevented because the
+/// nonce is removed only after successful verification (inside
+/// `claim_nonce`, under its single write guard), so a re-presented nonce
+/// fails the lookup like any miss. A successful claim must still match
+/// all three.
 #[derive(Clone)]
 struct NonceEntry {
     user_name: String,
@@ -111,7 +118,7 @@ fn has_bitcoin_prefix(data: &[u8]) -> bool {
 /// distinct server-side keys (nonce maps, registration maps, per-name locks)
 /// that collapse onto ONE TXT name - a hijack/duplicate window. Callers
 /// canonicalise at the boundary: /challenge requires already-canonical input
-/// (400 on mismatch) and /register re-validates before the nonce claim, so
+/// (400 on mismatch) and /register verifies the signature and only then claims (consumes) the nonce, so
 /// the wallet/server contract stays deterministic.
 fn validate_dns_name(name: &str) -> bool {
     if name.is_empty() || name.len() > 63 {
