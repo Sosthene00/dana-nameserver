@@ -1580,7 +1580,7 @@ mod tests {
         let spend_secret = SecretKey::new(&mut thread_rng());
         let sp_addr = make_sp_address(&secp, &scan_secret, &spend_secret);
 
-        let message = "dana:v1:challenge:sp:deadbeef";
+        let message = "dana-register:sp:deadbeef:alice:example.com";
         let digest = Sha256::digest(message.as_bytes());
         let msg = Message::from_digest_slice(&digest).unwrap();
 
@@ -1602,7 +1602,7 @@ mod tests {
         let spend_secret = SecretKey::new(&mut thread_rng());
         let sp_addr = make_sp_address(&secp, &scan_secret, &spend_secret);
 
-        let message = "dana:v1:challenge:sp:deadbeef";
+        let message = "dana-register:sp:deadbeef:alice:example.com";
         let digest = Sha256::digest(message.as_bytes());
         let msg = Message::from_digest_slice(&digest).unwrap();
 
