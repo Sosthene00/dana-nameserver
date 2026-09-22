@@ -102,12 +102,26 @@ fn has_bitcoin_prefix(data: &[u8]) -> bool {
     data.starts_with(b"bitcoin:")
 }
 
-/// Validate that a string is a well-formed DNS label (RFC 1035).
+/// Validate that a string is a well-formed AND already-canonical DNS label
+/// (RFC 1035): 1-63 characters drawn from `[a-z0-9-]`, with no leading,
+/// trailing or consecutive hyphens.
+///
+/// Uppercase is rejected explicitly rather than silently folded: DNS is
+/// case-insensitive, so admitting "Alice" alongside "alice" would create two
+/// distinct server-side keys (nonce maps, registration maps, per-name locks)
+/// that collapse onto ONE TXT name - a hijack/duplicate window. Callers
+/// canonicalise at the boundary: /challenge requires already-canonical input
+/// (400 on mismatch) and /register re-validates before the nonce claim, so
+/// the wallet/server contract stays deterministic.
 fn validate_dns_name(name: &str) -> bool {
     if name.is_empty() || name.len() > 63 {
         return false;
     }
-    name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+    if name.starts_with('-') || name.ends_with('-') || name.contains("--") {
+        return false;
+    }
+    name.chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
 }
 
 /// Issue a single-use nonce for the challenge-response handshake and state the
@@ -154,7 +168,7 @@ async fn handle_challenge(
             AxumJson(ChallengeResponse {
                 id: request.id,
                 message:
-                    "Invalid user name: must be ASCII alphanumeric and hyphens only, 1-63 chars"
+                    "Invalid user name: must be a canonical RFC 1035 label (lowercase ASCII alphanumeric and hyphens, 1-63 chars, no leading/trailing/consecutive hyphen)"
                         .to_string(),
                 nonce: String::new(),
                 network_key: String::new(),
@@ -737,6 +751,25 @@ async fn handle_register(
             );
         }
     };
+
+    // R5 (review Medium #5): /register accepts only already-canonical labels,
+    // validated BEFORE the nonce claim so the compared strings match what
+    // /challenge stored (which likewise requires the canonical form). DNS is
+    // case-insensitive: silently lowercasing here would let "Alice" and "alice"
+    // hold distinct map keys over one TXT name, so non-canonical input is
+    // rejected explicitly (400) and the contract stays deterministic.
+    if !validate_dns_name(&user_name) {
+        return (
+            StatusCode::BAD_REQUEST,
+            AxumJson(RegisterResponse {
+                id: request.id,
+                message: "Invalid user name: must be a canonical RFC 1035 label (lowercase ASCII alphanumeric and hyphens, 1-63 chars, no leading/trailing/consecutive hyphen)".to_string(),
+                dana_address: None,
+                sp_address: None,
+                dns_record_id: None,
+            }),
+        );
+    }
 
     // ── Challenge-response enforcement ──
     // Refuse any DNS mutation unless the client presents a valid nonce issued
@@ -1656,6 +1689,8 @@ mod tests {
     fn test_validate_dns_name_valid() {
         assert!(validate_dns_name("alice"));
         assert!(validate_dns_name("alice-1"));
+        assert!(validate_dns_name("a-b"));
+        assert!(validate_dns_name("a1-b2-c3"));
         assert!(validate_dns_name("a".repeat(63).as_str()));
     }
 
@@ -1666,6 +1701,131 @@ mod tests {
         assert!(!validate_dns_name("alice@example"));
         assert!(!validate_dns_name("alice bob"));
         assert!(!validate_dns_name("alice."));
+        // R5: non-canonical input is rejected, never silently lowercased.
+        assert!(!validate_dns_name("Alice"));
+        assert!(!validate_dns_name("aLiCe"));
+        assert!(!validate_dns_name("-a"));
+        assert!(!validate_dns_name("a-"));
+        assert!(!validate_dns_name("a--b"));
+        assert!(!validate_dns_name("a-B"));
+        assert!(!validate_dns_name("A-b"));
+        assert!(!validate_dns_name("-Alice-"));
+    }
+
+    // ── R5: canonical labels enforced on BOTH endpoints ──
+    // /challenge must mint only for the canonical form: same name with a
+    // different case is a single label path, so one rejected variant can never
+    // fork a second nonce/map key over the one TXT name.
+    #[tokio::test]
+    async fn test_challenge_rejects_non_canonical_name() {
+        let secp = silentpayments::secp256k1::Secp256k1::new();
+        let scan_secret = silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
+        let spend_secret = silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
+        let sp_addr = make_sp_address(&secp, &scan_secret, &spend_secret);
+        let domain = "danawallet.app";
+        let state = Arc::new(register_state(domain));
+
+        for bad in ["Alice", "-alice", "alice-", "a--b", "Alice-Bob"] {
+            let resp = handle_challenge(
+                State(state.clone()),
+                Json(ChallengeRequest {
+                    id: format!("nc-{}", bad),
+                    domain: domain.to_string(),
+                    user_name: bad.to_string(),
+                    sp_address: sp_addr.to_string(),
+                }),
+            )
+            .await;
+            assert_eq!(
+                resp.0,
+                StatusCode::BAD_REQUEST,
+                "{} must be rejected as non-canonical",
+                bad
+            );
+        }
+
+        // The canonical form still mints, and it is the ONLY stored label:
+        // same-name-different-case collapsed to the one canonical path.
+        let resp = handle_challenge(
+            State(state.clone()),
+            Json(ChallengeRequest {
+                id: "nc-ok".to_string(),
+                domain: domain.to_string(),
+                user_name: "alice".to_string(),
+                sp_address: sp_addr.to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(resp.0, StatusCode::OK);
+        let store = state.nonce_store.read().await;
+        assert_eq!(store.len(), 1);
+        assert_eq!(store.values().next().unwrap().user_name, "alice");
+    }
+
+    // /register re-validates the claimed label BEFORE claim_nonce: a request
+    // whose case differs from the stored canonical entry is a 400 (not the
+    // 401 claim mismatch) and must not burn the nonce.
+    #[tokio::test]
+    async fn test_register_rejects_non_canonical_name_before_claim() {
+        let secp = silentpayments::secp256k1::Secp256k1::new();
+        let scan_secret = silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
+        let spend_secret = silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
+        let sp_addr = make_sp_address(&secp, &scan_secret, &spend_secret);
+        let domain = "danawallet.app";
+        let nonce = "nonce-r5-noncanon";
+        let canonical = "alice".to_string();
+        let mixed = "Alice".to_string();
+        let sp_str = sp_addr.to_string();
+        let state = Arc::new(register_state(domain));
+        make_nonce(
+            &state.nonce_store,
+            nonce,
+            &canonical,
+            &sp_str,
+            domain,
+            Instant::now() + Duration::from_secs(60),
+        )
+        .await;
+        let sig = sign_challenge(&secp, &spend_secret, "sp", nonce, &mixed, domain);
+
+        let resp = handle_register(
+            State(state.clone()),
+            Json(RegisterRequest {
+                id: "req-r5".to_string(),
+                domain: domain.to_string(),
+                user_name: Some(mixed.clone()),
+                sp_address: sp_str.clone(),
+                nonce: Some(nonce.to_string()),
+                signature: Some(sig),
+            }),
+        )
+        .await;
+        assert_eq!(resp.0, StatusCode::BAD_REQUEST);
+
+        // The rejected request never reached claim_nonce: the nonce survives
+        // for the legitimate canonical retry.
+        assert!(
+            claim_nonce(&state.nonce_store, nonce, &canonical, &sp_str, domain)
+                .await
+                .is_ok(),
+            "400 rejection must not consume the nonce"
+        );
+
+        // Even without any challenge material the 400 wins over the 401
+        // missing-nonce path, proving the check runs first in the handler.
+        let resp = handle_register(
+            State(state.clone()),
+            Json(RegisterRequest {
+                id: "req-r5-b".to_string(),
+                domain: domain.to_string(),
+                user_name: Some(mixed),
+                sp_address: sp_str,
+                nonce: None,
+                signature: None,
+            }),
+        )
+        .await;
+        assert_eq!(resp.0, StatusCode::BAD_REQUEST);
     }
 
     // Helper: build a SilentPaymentAddress from a scan key and a spend key.
@@ -2068,7 +2228,7 @@ mod tests {
         let sp_addr = make_sp_address(&secp, &scan_secret, &spend_secret);
         let domain = "danawallet.app";
         // Random name so the DNS existence check reports absent on the first pass.
-        let user_name = format!("dana_test_user_{}", rand::random::<u64>());
+        let user_name = format!("dana-test-user-{}", rand::random::<u64>());
 
         let m = wiremock::MockServer::start().await;
         Mock::given(method("POST"))
@@ -2404,7 +2564,7 @@ mod tests {
         let nonce = "nonce-good";
                 // Use a name almost certain to have no DNS record yet, so the DNS
         // existence check returns Ok(None) and registration proceeds.
-        let user_name = format!("dana_test_user_{}", rand::random::<u64>());
+        let user_name = format!("dana-test-user-{}", rand::random::<u64>());
         let sig = sign_challenge(&secp, &spend_secret, "sp", nonce, &user_name, domain);
 
         let m = wiremock::MockServer::start().await;
@@ -2529,7 +2689,7 @@ mod tests {
         let domain = "danawallet.app";
         let nonce = "nonce-new-fmt";
         // Name almost certainly unregistered, so the DNS existence check passes.
-        let user_name = format!("dana_test_user_{}", rand::random::<u64>());
+        let user_name = format!("dana-test-user-{}", rand::random::<u64>());
 
         // Happy path under the new bound format: signed over the very values the
         // claimed NonceEntry carries.
