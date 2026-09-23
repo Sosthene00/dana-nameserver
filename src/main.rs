@@ -191,7 +191,7 @@ async fn handle_challenge(
             addr
         }
         Err(e) => {
-            error!("Invalid SP address '{}': {}", request.sp_address, e);
+            warn!("Invalid SP address '{}': {}", request.sp_address, e);
             return (
                 StatusCode::BAD_REQUEST,
                 AxumJson(ChallengeResponse {
@@ -705,7 +705,7 @@ async fn handle_register(
                 sp_address
             }
             Err(e) => {
-                error!("Invalid SP address '{}': {}", request.sp_address, e);
+                warn!("Invalid SP address '{}': {}", request.sp_address, e);
                 return (
                     StatusCode::BAD_REQUEST,
                     AxumJson(RegisterResponse {
@@ -796,8 +796,8 @@ async fn handle_register(
     // (dana-register:{network_key}:{nonce}:{user_name}:{domain}) signed with the spend private
     // key that derives the claimed SP address.
     let nonce = match request.nonce {
-        Some(nonce) => nonce,
-        None => {
+        Some(nonce) if !nonce.trim().is_empty() => nonce,
+        _ => {
             return (
                 StatusCode::UNAUTHORIZED,
                 AxumJson(RegisterResponse {
@@ -812,8 +812,8 @@ async fn handle_register(
         }
     };
     let signature = match request.signature {
-        Some(signature) => signature,
-        None => {
+        Some(signature) if !signature.trim().is_empty() => signature,
+        _ => {
             return (
                 StatusCode::UNAUTHORIZED,
                 AxumJson(RegisterResponse {
@@ -864,19 +864,19 @@ async fn handle_register(
     let entry = match entry {
         Some(entry) => entry,
         None => {
-            error!("Nonce claim failed for user {}: {}", user_name, "Invalid or missing nonce. Please call /challenge first.");
+            debug!("Nonce claim failed for user {}: {}", user_name, "Invalid or missing nonce. Please call /challenge first.");
             return unauthorized("Invalid or missing nonce. Please call /challenge first.".to_string());
         }
     };
     if entry.is_expired() {
-        error!("Nonce claim failed for user {}: {}", user_name, "Challenge nonce expired. Please request a new one.");
+        debug!("Nonce claim failed for user {}: {}", user_name, "Challenge nonce expired. Please request a new one.");
         return unauthorized("Challenge nonce expired. Please request a new one.".to_string());
     }
     if entry.user_name != user_name
         || entry.sp_address != sp_address.to_string()
         || entry.domain != state.domain
     {
-        error!("Nonce claim failed for user {}: {}", user_name, "Nonce does not match this request. Request a new one.");
+        debug!("Nonce claim failed for user {}: {}", user_name, "Nonce does not match this request. Request a new one.");
         return unauthorized("Nonce does not match this request. Request a new one.".to_string());
     }
 
@@ -890,7 +890,7 @@ async fn handle_register(
     // checked by the read-only pre-check above; the claim below re-validates them.
     let message = challenge_message(network_key, &nonce, &entry.user_name, &entry.domain);
     if let Err(e) = verify_schnorr_signature(&signature, &message, &sp_address) {
-        error!(
+        warn!(
             "Signature verification failed for user {} on {}: {}",
             user_name, state.domain, e
         );
@@ -924,7 +924,7 @@ async fn handle_register(
             claimed
         }
         Err(e) => {
-            error!("Nonce claim failed for user {}: {}", user_name, e);
+            debug!("Nonce claim failed for user {}: {}", user_name, e);
             return (
                 StatusCode::UNAUTHORIZED,
                 AxumJson(RegisterResponse {
@@ -999,7 +999,7 @@ async fn handle_register(
         }
         // A different owner claimed this name in-process: same conflict verdict as
         // the live-check branch, and it can never be overwritten.
-        error!("TXT record already exists for user name: {}", user_name);
+        warn!("TXT record already exists for user name: {}", user_name);
         return (
             StatusCode::CONFLICT,
             AxumJson(RegisterResponse {
@@ -1044,7 +1044,7 @@ async fn handle_register(
                     }),
                 );
             }
-            error!("TXT record already exists for user name: {}", user_name);
+            warn!("TXT record already exists for user name: {}", user_name);
             return (
                 StatusCode::CONFLICT,
                 AxumJson(RegisterResponse {
@@ -1192,7 +1192,7 @@ async fn handle_lookup_sp_address(
             sp_address
         }
         Err(e) => {
-            error!("Invalid SP address '{}': {}", query.sp_address, e);
+            warn!("Invalid SP address '{}': {}", query.sp_address, e);
             return (
                 StatusCode::BAD_REQUEST,
                 AxumJson(LookupResponse {
@@ -1255,7 +1255,7 @@ async fn handle_prefix_search(
 
     // Validate prefix length (minimum 3 characters)
     if query.prefix.len() < 3 {
-        error!(
+        warn!(
             "Prefix too short: '{}' (minimum 3 characters required)",
             query.prefix
         );
@@ -2489,6 +2489,133 @@ mod tests {
         .await;
 
         assert_eq!(resp.0, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_register_empty_string_nonce_treated_as_missing() {
+        let secp = silentpayments::secp256k1::Secp256k1::new();
+        let scan_secret = silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
+        let spend_secret = silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
+        let sp_addr = make_sp_address(&secp, &scan_secret, &spend_secret);
+        let domain = "danawallet.app";
+
+        let state = register_state(domain);
+
+        let resp = handle_register(
+            State(Arc::new(state)),
+            Json(RegisterRequest {
+                id: "req1".to_string(),
+                domain: domain.to_string(),
+                user_name: Some("alice".to_string()),
+                sp_address: sp_addr.to_string(),
+                nonce: Some("".to_string()), // empty-string nonce == missing nonce
+                signature: Some("00".repeat(64)),
+            }),
+        )
+        .await;
+
+        assert_eq!(resp.0, StatusCode::UNAUTHORIZED);
+        assert!(
+            resp.1.0.message.contains("Missing nonce"),
+            "empty-string nonce must hit the 401 missing-nonce branch, got {:?}",
+            resp.1.0.message
+        );
+    }
+
+    #[tokio::test]
+    async fn test_register_whitespace_only_nonce_treated_as_missing() {
+        let secp = silentpayments::secp256k1::Secp256k1::new();
+        let scan_secret = silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
+        let spend_secret = silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
+        let sp_addr = make_sp_address(&secp, &scan_secret, &spend_secret);
+        let domain = "danawallet.app";
+
+        let state = register_state(domain);
+
+        let resp = handle_register(
+            State(Arc::new(state)),
+            Json(RegisterRequest {
+                id: "req1".to_string(),
+                domain: domain.to_string(),
+                user_name: Some("alice".to_string()),
+                sp_address: sp_addr.to_string(),
+                nonce: Some("   \t ".to_string()), // whitespace-only nonce == missing
+                signature: Some("00".repeat(64)),
+            }),
+        )
+        .await;
+
+        assert_eq!(resp.0, StatusCode::UNAUTHORIZED);
+        assert!(
+            resp.1.0.message.contains("Missing nonce"),
+            "whitespace-only nonce must hit the 401 missing-nonce branch, got {:?}",
+            resp.1.0.message
+        );
+    }
+
+    #[tokio::test]
+    async fn test_register_empty_string_signature_treated_as_missing() {
+        let secp = silentpayments::secp256k1::Secp256k1::new();
+        let scan_secret = silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
+        let spend_secret = silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
+        let sp_addr = make_sp_address(&secp, &scan_secret, &spend_secret);
+        let domain = "danawallet.app";
+
+        let state = register_state(domain);
+
+        // The signature extraction guard runs before the nonce lookup, so the
+        // well-formed-but-never-issued nonce here is never consulted: the empty
+        // signature must short-circuit to the 401 missing-signature branch.
+        let resp = handle_register(
+            State(Arc::new(state)),
+            Json(RegisterRequest {
+                id: "req1".to_string(),
+                domain: domain.to_string(),
+                user_name: Some("alice".to_string()),
+                sp_address: sp_addr.to_string(),
+                nonce: Some("00".repeat(64)),
+                signature: Some("".to_string()), // empty-string signature == missing
+            }),
+        )
+        .await;
+
+        assert_eq!(resp.0, StatusCode::UNAUTHORIZED);
+        assert!(
+            resp.1.0.message.contains("Missing signature"),
+            "empty-string signature must hit the 401 missing-signature branch, got {:?}",
+            resp.1.0.message
+        );
+    }
+
+    #[tokio::test]
+    async fn test_register_whitespace_only_signature_treated_as_missing() {
+        let secp = silentpayments::secp256k1::Secp256k1::new();
+        let scan_secret = silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
+        let spend_secret = silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
+        let sp_addr = make_sp_address(&secp, &scan_secret, &spend_secret);
+        let domain = "danawallet.app";
+
+        let state = register_state(domain);
+
+        let resp = handle_register(
+            State(Arc::new(state)),
+            Json(RegisterRequest {
+                id: "req1".to_string(),
+                domain: domain.to_string(),
+                user_name: Some("alice".to_string()),
+                sp_address: sp_addr.to_string(),
+                nonce: Some("00".repeat(64)),
+                signature: Some("  \n ".to_string()), // whitespace-only signature == missing
+            }),
+        )
+        .await;
+
+        assert_eq!(resp.0, StatusCode::UNAUTHORIZED);
+        assert!(
+            resp.1.0.message.contains("Missing signature"),
+            "whitespace-only signature must hit the 401 missing-signature branch, got {:?}",
+            resp.1.0.message
+        );
     }
 
     #[tokio::test]
