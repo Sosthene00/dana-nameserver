@@ -1922,15 +1922,8 @@ mod tests {
     async fn test_claim_nonce_single_use() {
         let store: Arc<RwLock<HashMap<String, NonceEntry>>> = Arc::new(RwLock::new(HashMap::new()));
 
-        store.write().await.insert(
-            "nonce1".to_string(),
-            NonceEntry {
-                user_name: "alice".to_string(),
-                sp_address: "sp1qq...".to_string(),
-                domain: "danawallet.app".to_string(),
-                expires_at: Instant::now() + Duration::from_secs(60),
-            },
-        );
+        make_nonce(&store, "nonce1", "alice", "sp1qq...", "danawallet.app",
+                   Instant::now() + Duration::from_secs(60)).await;
 
         assert!(
             claim_nonce(&store, "nonce1", "alice", "sp1qq...", "danawallet.app")
@@ -1950,15 +1943,8 @@ mod tests {
     async fn test_claim_nonce_mismatch() {
         let store: Arc<RwLock<HashMap<String, NonceEntry>>> = Arc::new(RwLock::new(HashMap::new()));
 
-        store.write().await.insert(
-            "nonce1".to_string(),
-            NonceEntry {
-                user_name: "alice".to_string(),
-                sp_address: "sp1qq...".to_string(),
-                domain: "danawallet.app".to_string(),
-                expires_at: Instant::now() + Duration::from_secs(60),
-            },
-        );
+        make_nonce(&store, "nonce1", "alice", "sp1qq...", "danawallet.app",
+                   Instant::now() + Duration::from_secs(60)).await;
 
         // Wrong user name
         assert!(
@@ -1989,15 +1975,8 @@ mod tests {
         // asserted end-to-end in test_register_nonce_minted_for_alice_rejects_bob.
         // Given a live entry, the correctly-bound claim must succeed - re-mint
         // nonce1 and pin the happy path to exactly-one successful claim:
-        store.write().await.insert(
-            "nonce1".to_string(),
-            NonceEntry {
-                user_name: "alice".to_string(),
-                sp_address: "sp1qq...".to_string(),
-                domain: "danawallet.app".to_string(),
-                expires_at: Instant::now() + Duration::from_secs(60),
-            },
-        );
+        make_nonce(&store, "nonce1", "alice", "sp1qq...", "danawallet.app",
+                   Instant::now() + Duration::from_secs(60)).await;
         let entry = claim_nonce(&store, "nonce1", "alice", "sp1qq...", "danawallet.app")
             .await
             .expect("correctly-bound claim must succeed while the entry is live");
@@ -2046,15 +2025,8 @@ mod tests {
                 expires_at: Instant::now() - Duration::from_secs(10),
             },
         );
-        store.write().await.insert(
-            "fresh".to_string(),
-            NonceEntry {
-                user_name: "bob".to_string(),
-                sp_address: "sp1qq2...".to_string(),
-                domain: "danawallet.app".to_string(),
-                expires_at: Instant::now() + Duration::from_secs(60),
-            },
-        );
+        make_nonce(&store, "fresh", "bob", "sp1qq2...", "danawallet.app",
+                   Instant::now() + Duration::from_secs(60)).await;
 
         let counts: Arc<RwLock<HashMap<String, u32>>> = Arc::new(RwLock::new(HashMap::from([
             ("sp1qq...".to_string(), 1u32),
@@ -2145,15 +2117,8 @@ mod tests {
 
         // Complete the challenge-register cycle: the nonce is claimed and the
         // register flow releases the peer slot (same call handle_register makes).
-        state.nonce_store.write().await.insert(
-            "n1".to_string(),
-            NonceEntry {
-                user_name: "alice".to_string(),
-                sp_address: peer.clone(),
-                domain: domain.to_string(),
-                expires_at: Instant::now() + Duration::from_secs(60),
-            },
-        );
+        make_nonce(&state.nonce_store, "n1", "alice", &peer, domain,
+                   Instant::now() + Duration::from_secs(60)).await;
         claim_nonce(&state.nonce_store, "n1", "alice", &peer, domain)
             .await
             .expect("claim of a live matching nonce must succeed");
