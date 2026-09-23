@@ -680,6 +680,28 @@ async fn list_bitcoin_records(
     Ok(resp.result)
 }
 
+/// Shared constructor for the uniform `(status, RegisterResponse)` rejection
+/// shape used by the early-return arms in `handle_register`: the request id is
+/// echoed back and all three registration fields are `None`. A plain fn taking
+/// owned values (no captures) is deliberate: the R7 inlined 401 arms dodged a
+/// borrow-checker conflict between a `request`-capturing closure and the later
+/// moves of `request.id`, which a non-capturing fn cannot reintroduce.
+fn reject(
+    status: StatusCode,
+    message: String,
+    request_id: String,
+) -> (StatusCode, AxumJson<RegisterResponse>) {
+    (
+        status,
+        AxumJson(RegisterResponse {
+            id: request_id,
+            message,
+            dana_address: None,
+            sp_address: None,
+            dns_record_id: None,
+        }),
+    )
+}
 async fn handle_register(
     State(state): State<Arc<AppState>>,
     Json(request): Json<RegisterRequest>,
@@ -687,29 +709,19 @@ async fn handle_register(
     // Just in case
     if state.zone_id.is_empty() || state.api_token.is_empty() {
         error!("Cloudflare credentials missing, DNS record creation failed");
-        return (
+        return reject(
             StatusCode::INTERNAL_SERVER_ERROR,
-            AxumJson(RegisterResponse {
-                id: request.id,
-                message: "Internal server error, please try again later".to_string(),
-                dana_address: None,
-                sp_address: None,
-                dns_record_id: None,
-            }),
+                "Internal server error, please try again later".to_string(),
+            request.id,
         );
     }
 
     // If the domain asked by client is not the domain we're registering for, we return a bad request
     if request.domain != state.domain {
-        return (
+        return reject(
             StatusCode::BAD_REQUEST,
-            AxumJson(RegisterResponse {
-                id: request.id,
-                message: format!("Server registers for domain: {}", state.domain),
-                dana_address: None,
-                sp_address: None,
-                dns_record_id: None,
-            }),
+                format!("Server registers for domain: {}", state.domain),
+            request.id,
         );
     }
 
@@ -722,33 +734,23 @@ async fn handle_register(
             }
             Err(e) => {
                 warn!("Invalid SP address '{}': {}", request.sp_address, e);
-                return (
+                return reject(
                     StatusCode::BAD_REQUEST,
-                    AxumJson(RegisterResponse {
-                        id: request.id,
-                        message: format!("Invalid SP address: {}", e),
-                        dana_address: None,
-                        sp_address: None,
-                        dns_record_id: None,
-                    }),
+                        format!("Invalid SP address: {}", e),
+                    request.id,
                 );
             }
         };
 
     if sp_address.network() != state.network {
-        return (
+        return reject(
             StatusCode::BAD_REQUEST,
-            AxumJson(RegisterResponse {
-                id: request.id,
-                message: format!(
+                format!(
                     "Registered address has wrong network type: {:?}, expected: {:?}",
                     sp_address.network(),
                     state.network
                 ),
-                dana_address: None,
-                sp_address: None,
-                dns_record_id: None,
-            }),
+            request.id,
         );
     }
 
@@ -757,15 +759,10 @@ async fn handle_register(
         SpNetwork::Mainnet => "sp",
         SpNetwork::Testnet => "tsp",
         SpNetwork::Regtest => {
-            return (
+            return reject(
                 StatusCode::BAD_REQUEST,
-                AxumJson(RegisterResponse {
-                    id: request.id,
-                    message: "Can't register regtest addresses".to_string(),
-                    dana_address: None,
-                    sp_address: None,
-                    dns_record_id: None,
-                }),
+                    "Can't register regtest addresses".to_string(),
+                request.id,
             );
         }
     };
@@ -774,15 +771,10 @@ async fn handle_register(
     let user_name = match request.user_name {
         Some(user_name) => user_name,
         None => {
-            return (
+            return reject(
                 StatusCode::BAD_REQUEST,
-                AxumJson(RegisterResponse {
-                    id: request.id,
-                    message: "User name is required".to_string(),
-                    dana_address: None,
-                    sp_address: None,
-                    dns_record_id: None,
-                }),
+                    "User name is required".to_string(),
+                request.id,
             );
         }
     };
@@ -794,15 +786,10 @@ async fn handle_register(
     // hold distinct map keys over one TXT name, so non-canonical input is
     // rejected explicitly (400) and the contract stays deterministic.
     if !validate_dns_name(&user_name) {
-        return (
+        return reject(
             StatusCode::BAD_REQUEST,
-            AxumJson(RegisterResponse {
-                id: request.id,
-                message: "Invalid user name: must be a canonical RFC 1035 label (lowercase ASCII alphanumeric and hyphens, 1-63 chars, no leading/trailing/consecutive hyphen)".to_string(),
-                dana_address: None,
-                sp_address: None,
-                dns_record_id: None,
-            }),
+                "Invalid user name: must be a canonical RFC 1035 label (lowercase ASCII alphanumeric and hyphens, 1-63 chars, no leading/trailing/consecutive hyphen)".to_string(),
+            request.id,
         );
     }
 
@@ -814,32 +801,22 @@ async fn handle_register(
     let nonce = match request.nonce {
         Some(nonce) if !nonce.trim().is_empty() => nonce,
         _ => {
-            return (
+            return reject(
                 StatusCode::UNAUTHORIZED,
-                AxumJson(RegisterResponse {
-                    id: request.id.clone(),
-                    message: "Missing nonce: call /challenge first to obtain a challenge nonce"
+                    "Missing nonce: call /challenge first to obtain a challenge nonce"
                         .to_string(),
-                    dana_address: None,
-                    sp_address: None,
-                    dns_record_id: None,
-                }),
+                request.id.clone(),
             );
         }
     };
     let signature = match request.signature {
         Some(signature) if !signature.trim().is_empty() => signature,
         _ => {
-            return (
+            return reject(
                 StatusCode::UNAUTHORIZED,
-                AxumJson(RegisterResponse {
-                    id: request.id.clone(),
-                    message: "Missing signature: sign the challenge message with the spend private key"
+                    "Missing signature: sign the challenge message with the spend private key"
                         .to_string(),
-                    dana_address: None,
-                    sp_address: None,
-                    dns_record_id: None,
-                }),
+                request.id.clone(),
             );
         }
     };
@@ -865,35 +842,23 @@ async fn handle_register(
         let store = state.nonce_store.read().await;
         store.get(&nonce).cloned()
     };
-    let unauthorized = |message: String| {
-        (
-            StatusCode::UNAUTHORIZED,
-            AxumJson(RegisterResponse {
-                id: request.id.clone(),
-                message,
-                dana_address: None,
-                sp_address: None,
-                dns_record_id: None,
-            }),
-        )
-    };
     let entry = match entry {
         Some(entry) => entry,
         None => {
             debug!("Nonce claim failed for user {}: {}", user_name, ERR_NO_CHALLENGE);
-            return unauthorized(ERR_NO_CHALLENGE.to_string());
+            return reject(StatusCode::UNAUTHORIZED, ERR_NO_CHALLENGE.to_string(), request.id.clone());
         }
     };
     if entry.is_expired() {
         debug!("Nonce claim failed for user {}: {}", user_name, ERR_EXPIRED);
-        return unauthorized(ERR_EXPIRED.to_string());
+        return reject(StatusCode::UNAUTHORIZED, ERR_EXPIRED.to_string(), request.id.clone());
     }
     if entry.user_name != user_name
         || entry.sp_address != sp_address.to_string()
         || entry.domain != state.domain
     {
         debug!("Nonce claim failed for user {}: {}", user_name, ERR_MISMATCH);
-        return unauthorized(ERR_MISMATCH.to_string());
+        return reject(StatusCode::UNAUTHORIZED, ERR_MISMATCH.to_string(), request.id.clone());
     }
 
     // [4]-[5] Recompute the challenge message (challenge_message is the single source
@@ -910,15 +875,10 @@ async fn handle_register(
             "Signature verification failed for user {} on {}: {}",
             user_name, state.domain, e
         );
-        return (
+        return reject(
             StatusCode::UNAUTHORIZED,
-            AxumJson(RegisterResponse {
-                id: request.id.clone(),
-                message: e,
-                dana_address: None,
-                sp_address: None,
-                dns_record_id: None,
-            }),
+                e,
+            request.id.clone(),
         );
     }
 
@@ -941,15 +901,10 @@ async fn handle_register(
         }
         Err(e) => {
             debug!("Nonce claim failed for user {}: {}", user_name, e);
-            return (
+            return reject(
                 StatusCode::UNAUTHORIZED,
-                AxumJson(RegisterResponse {
-                    id: request.id.clone(),
-                    message: e,
-                    dana_address: None,
-                    sp_address: None,
-                    dns_record_id: None,
-                }),
+                    e,
+                request.id.clone(),
             );
         }
     };
@@ -1082,15 +1037,10 @@ async fn handle_register(
                 "Error checking for existing TXT record for user name {}: {}",
                 user_name, e
             );
-            return (
+            return reject(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                AxumJson(RegisterResponse {
-                    id: request.id,
-                    message: format!("Error checking for existing TXT record: {}", e),
-                    dana_address: None,
-                    sp_address: None,
-                    dns_record_id: None,
-                }),
+                    format!("Error checking for existing TXT record: {}", e),
+                request.id,
             );
         }
     };
@@ -1137,29 +1087,19 @@ async fn handle_register(
                 "Failed to create TXT record: No ID returned from Cloudflare for {}",
                 txt_name
             );
-            return (
+            return reject(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                AxumJson(RegisterResponse {
-                    id: request.id,
-                    message: "Failed to create DNS record: No ID returned from Cloudflare"
+                    "Failed to create DNS record: No ID returned from Cloudflare"
                         .to_string(),
-                    dana_address: None,
-                    sp_address: None,
-                    dns_record_id: None,
-                }),
+                request.id,
             );
         }
         Err(e) => {
             error!("Error creating TXT record {}: {}", txt_name, e);
-            return (
+            return reject(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                AxumJson(RegisterResponse {
-                    id: request.id,
-                    message: format!("Failed to create DNS record: {}", e),
-                    dana_address: None,
-                    sp_address: None,
-                    dns_record_id: None,
-                }),
+                    format!("Failed to create DNS record: {}", e),
+                request.id,
             );
         }
     };
