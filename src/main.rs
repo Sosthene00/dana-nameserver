@@ -49,7 +49,14 @@ const MAX_TRACKED_PEERS: usize = 1_000;
 const MAX_TRACKED_NAMES: usize = 10_000;
 
 /// A nonce issued by the challenge endpoint. Bound to the user_name / SP
-/// address / domain it was minted for so a later claim must match all three.
+/// address / domain at mint time. The entry stays in the store until
+/// signature verification succeeds: a failed signature verification does
+/// NOT consume the nonce, so the client may retry with a corrected
+/// signature until the TTL expires. Replay is prevented because the
+/// nonce is removed only after successful verification (inside
+/// `claim_nonce`, under its single write guard), so a re-presented nonce
+/// fails the lookup like any miss. A successful claim must still match
+/// all three.
 #[derive(Clone)]
 struct NonceEntry {
     user_name: String,
@@ -111,7 +118,7 @@ fn has_bitcoin_prefix(data: &[u8]) -> bool {
 /// distinct server-side keys (nonce maps, registration maps, per-name locks)
 /// that collapse onto ONE TXT name - a hijack/duplicate window. Callers
 /// canonicalise at the boundary: /challenge requires already-canonical input
-/// (400 on mismatch) and /register re-validates before the nonce claim, so
+/// (400 on mismatch) and /register verifies the signature and only then claims (consumes) the nonce, so
 /// the wallet/server contract stays deterministic.
 fn validate_dns_name(name: &str) -> bool {
     if name.is_empty() || name.len() > 63 {
@@ -339,6 +346,13 @@ async fn handle_challenge(
 /// Verify a Schnorr signature over `message` using the spend public key
 /// derived from `sp_address`. The message is SHA-256 hashed before
 /// verification, as required by the secp256k1 Schnorr signature scheme.
+///
+/// R7 invariant (verify-before-claim): verification is pure - it holds no
+/// lock and mutates nothing - and the register handler calls it BEFORE
+/// claim_nonce, so a failed signature verification must NOT consume the
+/// nonce; the client may retry with a corrected signature until the TTL
+/// expires. Replay is prevented because claim_nonce removes the nonce only
+/// after successful verification.
 fn verify_schnorr_signature(
     signature_hex: &str,
     message: &str,
@@ -376,6 +390,14 @@ fn verify_schnorr_signature(
 /// Atomically claim a nonce: it must exist, match the user_name / SP address /
 /// domain, and not be expired. Claiming consumes it (single-use); on any later
 /// failure the client must request a fresh challenge.
+///
+/// R7 invariant (verify-before-claim): the register handler verifies the
+/// signature over the challenge message BEFORE calling this, so a failed
+/// signature verification must NOT consume the nonce; the client may retry
+/// with a corrected signature until the TTL expires. This is the only place
+/// the nonce is removed, and only after that verification succeeded - the
+/// single `remove` under one write guard is also what makes replay of a
+/// consumed nonce fail the lookup.
 async fn claim_nonce(
     nonce_store: &Arc<RwLock<HashMap<String, NonceEntry>>>,
     nonce: &str,
@@ -808,6 +830,83 @@ async fn handle_register(
 
     // Claim the single-use nonce: it must exist, not be expired, and match this
     // request's user_name / SP address / domain.
+    //
+    // R7 (verify-before-claim): the signature is verified BEFORE the nonce is
+    // consumed, so a request with a bad signature no longer burns it.
+    // Invariant: a failed signature verification must NOT consume the nonce;
+    // the client may retry with a corrected signature until the TTL expires.
+    // Replay stays prevented because the nonce is removed only after
+    // successful verification - inside claim_nonce below, under one write
+    // guard - so re-presenting a consumed nonce fails the lookup in [1]
+    // exactly like any other miss.
+    //
+    // [1]-[3] Read-only pre-check: the nonce must exist, not be expired, and
+    // match this request's user_name / SP address / domain. It only clones
+    // the entry under the read guard, never consuming it, and the 401
+    // responses below reuse claim_nonce's own error strings verbatim so the
+    // client-visible contract for rejected requests is unchanged.
+    let entry = {
+        let store = state.nonce_store.read().await;
+        store.get(&nonce).cloned()
+    };
+    let unauthorized = |message: String| {
+        (
+            StatusCode::UNAUTHORIZED,
+            AxumJson(RegisterResponse {
+                id: request.id.clone(),
+                message,
+                dana_address: None,
+                sp_address: None,
+                dns_record_id: None,
+            }),
+        )
+    };
+    let entry = match entry {
+        Some(entry) => entry,
+        None => {
+            error!("Nonce claim failed for user {}: {}", user_name, "Invalid or missing nonce. Please call /challenge first.");
+            return unauthorized("Invalid or missing nonce. Please call /challenge first.".to_string());
+        }
+    };
+    if entry.is_expired() {
+        error!("Nonce claim failed for user {}: {}", user_name, "Challenge nonce expired. Please request a new one.");
+        return unauthorized("Challenge nonce expired. Please request a new one.".to_string());
+    }
+    if entry.user_name != user_name
+        || entry.sp_address != sp_address.to_string()
+        || entry.domain != state.domain
+    {
+        error!("Nonce claim failed for user {}: {}", user_name, "Nonce does not match this request. Request a new one.");
+        return unauthorized("Nonce does not match this request. Request a new one.".to_string());
+    }
+
+    // [4]-[5] Recompute the challenge message (challenge_message is the single source
+    // of truth, post-R3 format) from the server-side bindings stored on the
+    // looked-up entry, and verify the Schnorr signature BEFORE the nonce is
+    // claimed. Verification is pure - no locks, no store mutation - so a
+    // rejected signature leaves the nonce in place for a corrected retry
+    // until TTL (R7 verify-before-claim).
+    // The bindings below come from the looked-up entry and match the request fields
+    // checked by the read-only pre-check above; the claim below re-validates them.
+    let message = challenge_message(network_key, &nonce, &entry.user_name, &entry.domain);
+    if let Err(e) = verify_schnorr_signature(&signature, &message, &sp_address) {
+        error!(
+            "Signature verification failed for user {} on {}: {}",
+            user_name, state.domain, e
+        );
+        return (
+            StatusCode::UNAUTHORIZED,
+            AxumJson(RegisterResponse {
+                id: request.id.clone(),
+                message: e,
+                dana_address: None,
+                sp_address: None,
+                dns_record_id: None,
+            }),
+        );
+    }
+
+
     let claimed = match claim_nonce(
         &state.nonce_store,
         &nonce,
@@ -838,30 +937,13 @@ async fn handle_register(
             );
         }
     };
-
-    // Verify the Schnorr signature over the challenge message for this nonce.
-    // The bindings below come from the CLAIMED entry, so they are exactly the
-    // values claim_nonce just validated against this request.
-    let message = challenge_message(network_key, &nonce, &claimed.user_name, &claimed.domain);
-    if let Err(e) = verify_schnorr_signature(&signature, &message, &sp_address) {
-        error!(
-            "Signature verification failed for user {} on {}: {}",
-            user_name, state.domain, e
-        );
-        return (
-            StatusCode::UNAUTHORIZED,
-            AxumJson(RegisterResponse {
-                id: request.id.clone(),
-                message: e,
-                dana_address: None,
-                sp_address: None,
-                dns_record_id: None,
-            }),
-        );
-    }
+    // [6] Signature valid: only now consume the nonce. claim_nonce re-checks
+    // existence / expiry / bindings atomically under its single write guard,
+    // so a concurrent claim or an expiry crossed during verification is
+    // still rejected here.
     info!(
         "Challenge-response verified for {}@{} (nonce {})",
-        user_name, state.domain, nonce
+        claimed.user_name, claimed.domain, nonce
     );
 
     // R4: the DNS existence check and the Cloudflare TXT create below form a
@@ -2548,6 +2630,78 @@ mod tests {
         // Regardless of what the first call returned, the reused nonce must 401.
         assert_eq!(resp.0, StatusCode::UNAUTHORIZED);
         let _ = first;
+    }
+
+#[tokio::test]
+    async fn test_register_wrong_signature_does_not_burn_nonce() {
+        let _guard = CF_ENV_LOCK.lock().unwrap();
+        let secp = silentpayments::secp256k1::Secp256k1::new();
+        let scan_secret = silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
+        let spend_secret = silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
+        let sp_addr = make_sp_address(&secp, &scan_secret, &spend_secret);
+        let domain = "danawallet.app";
+        let nonce = "nonce-bad-then-good";
+                // Use a name almost certain to have no DNS record yet, so the DNS
+        // existence check returns Ok(None) and registration proceeds.
+        let user_name = format!("dana-test-user-{}", rand::random::<u64>());
+        let good_sig = sign_challenge(&secp, &spend_secret, "sp", nonce, &user_name, domain);
+        let bad_sig = sign_challenge(&secp, &spend_secret, "sp-bogus", nonce, &user_name, domain);
+
+        let m = wiremock::MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/zones/zone-test/dns_records"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(&serde_json::json!({
+                        "success": true,
+                        "result": { "id": "rec-xyz" },
+                    })),
+            )
+            .expect(1)
+            .mount(&m)
+            .await;
+        unsafe { std::env::set_var("CLOUDFLARE_API_BASE_URL", m.uri()); }
+
+        let state = register_state(domain);
+        make_nonce(
+            &state.nonce_store,
+            nonce,
+            &user_name,
+            &sp_addr.to_string(),
+            domain,
+            Instant::now() + Duration::from_secs(60),
+        ).await;
+
+        let resp_bad = handle_register(
+            State(Arc::new(state.clone())),
+            Json(RegisterRequest {
+                id: "req-bad".to_string(),
+                domain: domain.to_string(),
+                user_name: Some(user_name.clone()),
+                sp_address: sp_addr.to_string(),
+                nonce: Some(nonce.to_string()),
+                signature: Some(bad_sig),
+            }),
+        )
+        .await;
+        assert_eq!(resp_bad.0, StatusCode::UNAUTHORIZED);
+let resp_good = handle_register(
+            State(Arc::new(state)),
+            Json(RegisterRequest {
+                id: "req-good".to_string(),
+                domain: domain.to_string(),
+                user_name: Some(user_name.clone()),
+                sp_address: sp_addr.to_string(),
+                nonce: Some(nonce.to_string()),
+                signature: Some(good_sig),
+            }),
+        )
+        .await;
+
+        unsafe { std::env::remove_var("CLOUDFLARE_API_BASE_URL"); }
+        // Valid signature + valid nonce must pass challenge-response: any
+        // outcome other than UNAUTHORIZED proves the enforcement accepted it.
+        assert_ne!(resp_good.0, StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
