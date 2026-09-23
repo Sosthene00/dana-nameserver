@@ -1878,8 +1878,7 @@ mod tests {
 
     #[test]
     fn test_verify_schnorr_signature_valid() {
-        use silentpayments::secp256k1::{Keypair, Message, Secp256k1, SecretKey};
-        use sha2::{Digest, Sha256};
+        use silentpayments::secp256k1::{Secp256k1, SecretKey};
         use rand::thread_rng;
 
         let secp = Secp256k1::new();
@@ -1888,20 +1887,15 @@ mod tests {
         let sp_addr = make_sp_address(&secp, &scan_secret, &spend_secret);
 
         let message = "dana-register:sp:deadbeef:alice:example.com";
-        let digest = Sha256::digest(message.as_bytes());
-        let msg = Message::from_digest_slice(&digest).unwrap();
 
-        let keypair = Keypair::from_seckey_slice(&secp, &spend_secret.secret_bytes()).unwrap();
-        let sig = secp.sign_schnorr_with_rng(&msg, &keypair, &mut thread_rng());
-        let sig_hex = hex::encode(sig.serialize());
+        let sig_hex = sign_challenge(&secp, &spend_secret, "sp", "deadbeef", "alice", "example.com");
 
         assert!(verify_schnorr_signature(&secp, &sig_hex, message, &sp_addr).is_ok());
     }
 
     #[test]
     fn test_verify_schnorr_signature_invalid() {
-        use silentpayments::secp256k1::{Keypair, Message, Secp256k1, SecretKey};
-        use sha2::{Digest, Sha256};
+        use silentpayments::secp256k1::{Secp256k1, SecretKey};
         use rand::thread_rng;
 
         let secp = Secp256k1::new();
@@ -1910,14 +1904,11 @@ mod tests {
         let sp_addr = make_sp_address(&secp, &scan_secret, &spend_secret);
 
         let message = "dana-register:sp:deadbeef:alice:example.com";
-        let digest = Sha256::digest(message.as_bytes());
-        let msg = Message::from_digest_slice(&digest).unwrap();
 
         // Sign with a different key than the spend key embedded in sp_addr
         let other_secret = SecretKey::new(&mut thread_rng());
-        let keypair = Keypair::from_seckey_slice(&secp, &other_secret.secret_bytes()).unwrap();
-        let sig = secp.sign_schnorr_with_rng(&msg, &keypair, &mut thread_rng());
-        let sig_hex = hex::encode(sig.serialize());
+
+        let sig_hex = sign_challenge(&secp, &other_secret, "sp", "deadbeef", "alice", "example.com");
 
         assert!(verify_schnorr_signature(&secp, &sig_hex, message, &sp_addr).is_err());
 
