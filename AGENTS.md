@@ -95,24 +95,25 @@ Agent: **Run `cargo test`** after non-trivial changes and include the result.
 
 ### Route Handlers
 - `GET /v1/info` — Server info (domain, network)
-- `POST /v1/register/prepare` — Initiate registration, returns a challenge nonce
-- `POST /v1/register` — Register with signature proof (requires /register/prepare first)
+- `POST /v1/challenge` — Issue a single-use nonce and the exact challenge message to sign
+- `POST /v1/register` — Register with nonce + Schnorr signature over the /v1/challenge message (call /v1/challenge first)
 - `GET /v1/lookup?sp_address=...` — Lookup Dana address(es) for an SP address
 - `GET /v1/search?prefix=...` — Prefix search across Dana addresses (min 3 chars, max 25 results)
 
 ### Authentication Flow
 
-Registration uses challenge-response authentication to prove ownership of the SP address:
+Registration uses challenge-response authentication to prove ownership of the SP address — one extra round-trip to `/v1/challenge`, no state kept client-side beyond the nonce:
 
-1. **Prepare** — `POST /v1/register/prepare` with `{id, domain, user_name, sp_address}`
-   → Server validates inputs and returns `{nonce}` (valid for 5 minutes)
-2. **Sign** — Client signs `"dana-register:{nonce}:{user_name}:{domain}"` with the spend private key
-   corresponding to the SP address (Schnorr signature, 64 bytes hex)
-3. **Register** — `POST /v1/register` with `{id, domain, user_name, sp_address, signature, nonce}`
-   → Server verifies nonce (exists, matches, not expired), then verifies signature, then creates DNS record
-4. **One-time** — Nonce is invalidated after use; re-attempt requires new /register/prepare call
+1. **Challenge** — `POST /v1/challenge` with `{id, domain, user_name, sp_address}`
+   → Server validates inputs, issues a single-use nonce bound to `(user_name, sp_address, domain)` and returns `{id, message, nonce, network_key, expires_at}` (valid for `NONCE_TTL_SECS` = 300 s)
+2. **Sign** — Client signs the returned `message`, built by `challenge_message()` (`src/main.rs`) as
+   `dana-register:{network_key}:{nonce}:{user_name}:{domain}`,
+   with the spend private key corresponding to the SP address (Schnorr signature, message SHA-256 hashed before signing, 64 bytes hex)
+3. **Register** — `POST /v1/register` with `{id, domain, user_name, sp_address, nonce, signature}`
+   → Server verifies the Schnorr signature FIRST (a failed signature does not burn the nonce, so a corrected retry is allowed until `expires_at`), then claims (consumes) the nonce, then creates the DNS record
+4. **401 semantics** — Missing `nonce`/`signature`, unknown/expired nonce, or a nonce bound to different `user_name`/`sp_address`/`domain` values return `401 Unauthorized`; re-request `/v1/challenge` for a fresh nonce. Over-cap challenge issuance returns `429`.
 
-**DNS name constraints**: alphanumeric + hyphens only, 1-63 characters.
+**DNS name constraints**: `user_name` must be an already-canonical RFC 1035 label — `[a-z0-9-]`, 1-63 characters, no leading/trailing/consecutive hyphen; uppercase input is rejected (not folded) on both `/v1/challenge` and `/v1/register`.
 
 ## 6. Testing Conventions
 
