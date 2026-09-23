@@ -27,6 +27,10 @@ use crate::api_structs::{
 };
 
 
+const ERR_NO_CHALLENGE: &str = "Invalid or missing nonce. Please call /challenge first.";
+const ERR_EXPIRED: &str = "Challenge nonce expired. Please request a new one.";
+const ERR_MISMATCH: &str = "Nonce does not match this request. Request a new one.";
+
 /// The per-name lock map behind AppState.name_locks (see `name_lock`).
 type NameLockMap = Mutex<HashMap<String, Arc<Mutex<()>>>>;
 
@@ -422,16 +426,14 @@ async fn claim_nonce(
     let mut store = nonce_store.write().await;
     let claimed = match store.remove(nonce) {
         Some(claimed) => claimed,
-        None => {
-            return Err("Invalid or missing nonce. Please call /challenge first.".to_string());
-        }
+        None => return Err(ERR_NO_CHALLENGE.to_string()),
     };
     drop(store);
     if claimed.is_expired() {
-        return Err("Challenge nonce expired. Please request a new one.".to_string());
+        return Err(ERR_EXPIRED.to_string());
     }
     if claimed.user_name != user_name || claimed.sp_address != sp_address || claimed.domain != domain {
-        return Err("Nonce does not match this request. Request a new one.".to_string());
+        return Err(ERR_MISMATCH.to_string());
     }
     Ok(claimed)
 }
@@ -878,20 +880,20 @@ async fn handle_register(
     let entry = match entry {
         Some(entry) => entry,
         None => {
-            debug!("Nonce claim failed for user {}: {}", user_name, "Invalid or missing nonce. Please call /challenge first.");
-            return unauthorized("Invalid or missing nonce. Please call /challenge first.".to_string());
+            debug!("Nonce claim failed for user {}: {}", user_name, ERR_NO_CHALLENGE);
+            return unauthorized(ERR_NO_CHALLENGE.to_string());
         }
     };
     if entry.is_expired() {
-        debug!("Nonce claim failed for user {}: {}", user_name, "Challenge nonce expired. Please request a new one.");
-        return unauthorized("Challenge nonce expired. Please request a new one.".to_string());
+        debug!("Nonce claim failed for user {}: {}", user_name, ERR_EXPIRED);
+        return unauthorized(ERR_EXPIRED.to_string());
     }
     if entry.user_name != user_name
         || entry.sp_address != sp_address.to_string()
         || entry.domain != state.domain
     {
-        debug!("Nonce claim failed for user {}: {}", user_name, "Nonce does not match this request. Request a new one.");
-        return unauthorized("Nonce does not match this request. Request a new one.".to_string());
+        debug!("Nonce claim failed for user {}: {}", user_name, ERR_MISMATCH);
+        return unauthorized(ERR_MISMATCH.to_string());
     }
 
     // [4]-[5] Recompute the challenge message (challenge_message is the single source
@@ -3322,10 +3324,7 @@ let resp_good = handle_register(
         )
         .await;
         assert_eq!(resp_bob.0, StatusCode::UNAUTHORIZED);
-        assert_eq!(
-            resp_bob.1.message,
-            "Nonce does not match this request. Request a new one."
-        );
+        assert_eq!(resp_bob.1.message, ERR_MISMATCH);
 
         // The mismatch attempt must not burn the nonce: the entry is still
         // present for alice and the peer counter is untouched.
