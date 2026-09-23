@@ -2042,6 +2042,39 @@ mod tests {
                 .await
                 .is_err()
         );
+
+        // Positive follow-up (t_846f86e5). Chosen invariant, stated: at this unit
+        // level claim_nonce removes the entry under its single write guard BEFORE
+        // validating the binding, so a mismatched claim consumes the nonce (the
+        // second and third assertions above therefore pass against the entry the
+        // first rejection already removed). The "a mismatched attempt must not
+        // burn the nonce" contract is the handler-level R7 verify-before-claim
+        // invariant, enforced by handle_register's read-only pre-check and
+        // asserted end-to-end in test_register_nonce_minted_for_alice_rejects_bob.
+        // Given a live entry, the correctly-bound claim must succeed - re-mint
+        // nonce1 and pin the happy path to exactly-one successful claim:
+        store.write().await.insert(
+            "nonce1".to_string(),
+            NonceEntry {
+                user_name: "alice".to_string(),
+                sp_address: "sp1qq...".to_string(),
+                domain: "danawallet.app".to_string(),
+                expires_at: Instant::now() + Duration::from_secs(60),
+            },
+        );
+        let entry = claim_nonce(&store, "nonce1", "alice", "sp1qq...", "danawallet.app")
+            .await
+            .expect("correctly-bound claim must succeed while the entry is live");
+        assert_eq!(entry.user_name, "alice");
+        assert_eq!(entry.sp_address, "sp1qq...");
+        assert_eq!(entry.domain, "danawallet.app");
+        // And single-use: the successful claim consumed it, so an immediate
+        // re-claim of the same nonce fails.
+        assert!(
+            claim_nonce(&store, "nonce1", "alice", "sp1qq...", "danawallet.app")
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
@@ -3117,5 +3150,189 @@ let resp_good = handle_register(
         .await;
 
         assert_eq!(resp.0, StatusCode::UNAUTHORIZED);
+    }
+
+    // -- t_846f86e5: direct handle_challenge / handle_register endpoint coverage --
+
+    async fn challenge_once(
+        state: &Arc<AppState>,
+        id: &str,
+        domain: &str,
+        user_name: &str,
+        sp_address: &str,
+    ) -> (StatusCode, AxumJson<ChallengeResponse>) {
+        handle_challenge(
+            State(state.clone()),
+            Json(ChallengeRequest {
+                id: id.to_string(),
+                domain: domain.to_string(),
+                user_name: user_name.to_string(),
+                sp_address: sp_address.to_string(),
+            }),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn test_challenge_success_exact_post_r3_message_and_fields() {
+        let secp = silentpayments::secp256k1::Secp256k1::new();
+        let scan_secret = silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
+        let spend_secret = silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
+        let sp_addr = make_sp_address(&secp, &scan_secret, &spend_secret);
+        let domain = "danawallet.app";
+        let state = Arc::new(register_state(domain));
+
+        let resp = challenge_once(&state, "req-ok-1", domain, "alice", &sp_addr.to_string()).await;
+        assert_eq!(resp.0, StatusCode::OK);
+        assert_eq!(resp.1.id, "req-ok-1");
+        assert_eq!(resp.1.network_key, "sp");
+        assert!(!resp.1.nonce.is_empty());
+        assert!(resp.1.expires_at > 0);
+        // Post-R3 wire contract asserted against the LITERAL format string (not
+        // via challenge_message) so drift of the single source of truth away
+        // from the documented client-side message fails this test loudly.
+        assert_eq!(
+            resp.1.message,
+            format!("dana-register:sp:{}:alice:danawallet.app", resp.1.nonce)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_challenge_reject_branches_400() {
+        let secp = silentpayments::secp256k1::Secp256k1::new();
+        let domain = "danawallet.app";
+        let state = Arc::new(register_state(domain));
+        let scan_secret = silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
+        let spend_secret = silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
+        let sp_addr = make_sp_address(&secp, &scan_secret, &spend_secret);
+
+        // Domain mismatch.
+        let resp = challenge_once(&state, "r1", "wrong.example", "alice", &sp_addr.to_string()).await;
+        assert_eq!(resp.0, StatusCode::BAD_REQUEST);
+        assert_eq!(resp.1.message, "Server registers for domain: danawallet.app");
+        assert!(resp.1.nonce.is_empty());
+
+        // Empty user name.
+        let resp = challenge_once(&state, "r2", domain, "", &sp_addr.to_string()).await;
+        assert_eq!(resp.0, StatusCode::BAD_REQUEST);
+        assert_eq!(resp.1.message, "User name is required");
+
+        // Unparseable SP address.
+        let resp = challenge_once(&state, "r3", domain, "alice", "not-an-sp-address").await;
+        assert_eq!(resp.0, StatusCode::BAD_REQUEST);
+        assert!(resp.1.message.starts_with("Invalid SP address: "));
+
+        // Wrong network: a testnet address against this mainnet server.
+        let t_scan = silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
+        let t_spend = silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
+        let t_addr = SilentPaymentCode::new_v0(
+            t_scan.public_key(&secp),
+            t_spend.public_key(&secp),
+            SpNetwork::Testnet,
+        );
+        let resp = challenge_once(&state, "r4", domain, "alice", &t_addr.to_string()).await;
+        assert_eq!(resp.0, StatusCode::BAD_REQUEST);
+        assert!(resp.1.message.starts_with("Address has wrong network type: "));
+
+        // Regtest: on a mainnet server the wrong-network guard fires first, so
+        // drive the dedicated regtest rejection with a regtest-serving state.
+        let mut regtest_state = register_state(domain);
+        regtest_state.network = SpNetwork::Regtest;
+        let regtest_state = Arc::new(regtest_state);
+        let r_scan = silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
+        let r_spend = silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
+        let r_addr = SilentPaymentCode::new_v0(
+            r_scan.public_key(&secp),
+            r_spend.public_key(&secp),
+            SpNetwork::Regtest,
+        );
+        let resp = challenge_once(&regtest_state, "r5", domain, "alice", &r_addr.to_string()).await;
+        assert_eq!(resp.0, StatusCode::BAD_REQUEST);
+        assert_eq!(resp.1.message, "Can't issue a challenge for regtest addresses");
+    }
+
+    #[tokio::test]
+    async fn test_challenge_global_pending_cap_429_rotating_sp_addresses() {
+        // The MAX_PENDING_NONCES aggregate branch. Distinct SP addresses rotate so
+        // no peer approaches max_nonces_per_peer and only the live-store count can
+        // trip the guard; the handler reads the cap from the state field, so
+        // lowering it keeps the test fast and fully offline.
+        let secp = silentpayments::secp256k1::Secp256k1::new();
+        let domain = "danawallet.app";
+        let mut state = register_state(domain);
+        state.max_pending_nonces = 3;
+        let state = Arc::new(state);
+
+        for i in 0..3u64 {
+            let scan_secret = silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
+            let spend_secret = silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
+            let sp_addr = make_sp_address(&secp, &scan_secret, &spend_secret);
+            let resp = challenge_once(&state, &format!("g-{i}"), domain, "alice", &sp_addr.to_string()).await;
+            assert_eq!(resp.0, StatusCode::OK, "mint {i} below the global cap must succeed");
+        }
+
+        let scan_secret = silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
+        let spend_secret = silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
+        let sp_addr = make_sp_address(&secp, &scan_secret, &spend_secret);
+        let resp = challenge_once(&state, "g-overflow", domain, "alice", &sp_addr.to_string()).await;
+        assert_eq!(resp.0, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(resp.1.message, "Too many pending challenges, please retry later");
+        assert!(resp.1.nonce.is_empty());
+    }
+
+    // End-to-end negative path across the real handler pair: a nonce minted by
+    // handle_challenge for `alice` must not register `bob`.
+    //
+    // Invariant (aligned with the R7 verify-before-claim contract above
+    // handle_register): the read-only pre-check rejects the name mismatch
+    // WITHOUT consuming the nonce - only a request that passes both the
+    // pre-check and signature verification reaches claim_nonce. We assert the
+    // nonce survives the mismatch attempt so its real owner can still register.
+    #[tokio::test]
+    async fn test_register_nonce_minted_for_alice_rejects_bob() {
+        let secp = silentpayments::secp256k1::Secp256k1::new();
+        let scan_secret = silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
+        let spend_secret = silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
+        let sp_addr = make_sp_address(&secp, &scan_secret, &spend_secret);
+        let domain = "danawallet.app";
+        let state = Arc::new(register_state(domain));
+
+        let minted = challenge_once(&state, "mint-1", domain, "alice", &sp_addr.to_string()).await;
+        assert_eq!(minted.0, StatusCode::OK);
+        let nonce = minted.1.nonce.clone();
+
+        // bob presents alice's nonce together with a correctly formed signature
+        // (signed for alice, as the challenge handed out). The mismatch is caught
+        // by the read-only pre-check before any verification or claim, so no
+        // Cloudflare/DNS access is involved on this path.
+        let sig_for_alice = sign_challenge(&secp, &spend_secret, "sp", &nonce, "alice", domain);
+        let resp_bob = handle_register(
+            State(state.clone()),
+            Json(RegisterRequest {
+                id: "bob-attempt".to_string(),
+                domain: domain.to_string(),
+                user_name: Some("bob".to_string()),
+                sp_address: sp_addr.to_string(),
+                nonce: Some(nonce.clone()),
+                signature: Some(sig_for_alice),
+            }),
+        )
+        .await;
+        assert_eq!(resp_bob.0, StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            resp_bob.1.message,
+            "Nonce does not match this request. Request a new one."
+        );
+
+        // The mismatch attempt must not burn the nonce: the entry is still
+        // present for alice and the peer counter is untouched.
+        assert!(
+            state.nonce_store.read().await.contains_key(&nonce),
+            "a name-mismatch rejection must leave the nonce in place for its owner"
+        );
+        assert_eq!(
+            state.peer_nonce_counts.read().await.get(&sp_addr.to_string()),
+            Some(&1)
+        );
     }
 }
