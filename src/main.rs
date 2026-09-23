@@ -69,7 +69,7 @@ struct AppState {
     network: SpNetwork,
     // Challenge-response nonce store for signature auth
     nonce_store: Arc<RwLock<HashMap<String, NonceEntry>>>,
-    // Per-peer outstanding nonce counts (keyed by request id) for rate limiting
+    // Per-peer outstanding nonce counts (keyed by the validated SP address string) for rate limiting
     peer_nonce_counts: Arc<RwLock<HashMap<String, u32>>>,
     // Global outstanding-nonce counter for the aggregate cap
     outstanding_nonces: Arc<AtomicU64>,
@@ -211,8 +211,8 @@ async fn handle_challenge(
     };
 
     // Rate limiting: global aggregate cap, then per-peer cap.
-    // The peer key is the client-supplied request id.
-    let peer = request.id.clone();
+    // The peer key is the validated SP address, never the client-supplied request id.
+    let peer = sp_address.to_string();
     if state.outstanding_nonces.load(Ordering::SeqCst) >= state.max_pending_nonces {
         warn!("Rejecting challenge request: nonce store at capacity");
         return (
