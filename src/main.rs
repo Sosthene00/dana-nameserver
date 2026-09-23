@@ -41,6 +41,9 @@ fn cloudflare_base_url() -> String {
 const NONCE_TTL_SECS: u64 = 300; // 5 minutes
 const MAX_PENDING_NONCES: u64 = 10_000;
 const MAX_NONCES_PER_PEER: u32 = 10;
+// Upper bound on distinct peer keys retained in peer_nonce_counts. A brand-new
+// peer past this cap is refused with 429 until expired/consumed slots are pruned.
+const MAX_TRACKED_PEERS: usize = 1_000;
 
 /// A nonce issued by the challenge endpoint. Bound to the user_name / SP
 /// address / domain it was minted for so a later claim must match all three.
@@ -210,24 +213,40 @@ async fn handle_challenge(
         }
     };
 
-    // Rate limiting: global aggregate cap, then per-peer cap.
+    // Rate limiting: aggregate cap, tracked-peers cap, and per-peer cap are all
+    // evaluated under a single peer_nonce_counts write-lock generation so the
+    // checks cannot straddle two map states (R2 t_24b413be coherence).
     // The peer key is the validated SP address, never the client-supplied request id.
     let peer = sp_address.to_string();
-    if state.outstanding_nonces.load(Ordering::SeqCst) >= state.max_pending_nonces {
-        warn!("Rejecting challenge request: nonce store at capacity");
-        return (
-            StatusCode::TOO_MANY_REQUESTS,
-            AxumJson(ChallengeResponse {
-                id: request.id,
-                message: "Too many pending challenges, please retry later".to_string(),
-                nonce: String::new(),
-                network_key: String::new(),
-                expires_at: 0,
-            }),
-        );
-    }
     {
         let mut counts = state.peer_nonce_counts.write().await;
+        if state.outstanding_nonces.load(Ordering::SeqCst) >= state.max_pending_nonces {
+            warn!("Rejecting challenge request: nonce store at capacity");
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                AxumJson(ChallengeResponse {
+                    id: request.id,
+                    message: "Too many pending challenges, please retry later".to_string(),
+                    nonce: String::new(),
+                    network_key: String::new(),
+                    expires_at: 0,
+                }),
+            );
+        }
+        if !counts.contains_key(&peer) && counts.len() >= MAX_TRACKED_PEERS {
+            warn!("Rejecting challenge request: tracked peer map at capacity");
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                AxumJson(ChallengeResponse {
+                    id: request.id,
+                    message: "Too many distinct peers pending challenges, please retry later"
+                        .to_string(),
+                    nonce: String::new(),
+                    network_key: String::new(),
+                    expires_at: 0,
+                }),
+            );
+        }
         let count = counts.entry(peer.clone()).or_insert(0);
         if *count >= state.max_nonces_per_peer {
             return (
@@ -355,10 +374,51 @@ async fn claim_nonce(
     Ok(())
 }
 
-/// Remove expired nonce entries to bound the in-memory store.
-async fn cleanup_expired_nonces(nonce_store: &Arc<RwLock<HashMap<String, NonceEntry>>>) {
-    let mut store = nonce_store.write().await;
-    store.retain(|_, entry| !entry.is_expired());
+/// Decrement a peer's outstanding-nonce counter, removing the key once it
+/// reaches zero so dead per-peer entries cannot accumulate in the map.
+fn decrement_peer_count(counts: &mut HashMap<String, u32>, peer: &str) {
+    if let Some(count) = counts.get_mut(peer) {
+        *count = count.saturating_sub(1);
+    }
+    if counts.get(peer) == Some(&0) {
+        counts.remove(peer);
+    }
+}
+
+/// Release one per-peer nonce slot after a nonce is consumed (the register
+/// flow calls this whenever a claim succeeds).
+async fn release_peer_nonce_slot(
+    peer_nonce_counts: &Arc<RwLock<HashMap<String, u32>>>,
+    peer: &str,
+) {
+    let mut counts = peer_nonce_counts.write().await;
+    decrement_peer_count(&mut counts, peer);
+}
+
+/// Remove expired nonce entries to bound the in-memory store, and decrement /
+/// prune the per-peer counters for exactly the entries dropped in this pass.
+async fn cleanup_expired_nonces(
+    nonce_store: &Arc<RwLock<HashMap<String, NonceEntry>>>,
+    peer_nonce_counts: &Arc<RwLock<HashMap<String, u32>>>,
+) {
+    let mut dropped_peers: Vec<String> = Vec::new();
+    {
+        let mut store = nonce_store.write().await;
+        store.retain(|_, entry| {
+            if entry.is_expired() {
+                dropped_peers.push(entry.sp_address.clone());
+                false
+            } else {
+                true
+            }
+        });
+    }
+    if !dropped_peers.is_empty() {
+        let mut counts = peer_nonce_counts.write().await;
+        for peer in &dropped_peers {
+            decrement_peer_count(&mut counts, peer);
+        }
+    }
 }
 
 async fn fetch_sp_address_from_txt_record(
@@ -671,7 +731,12 @@ async fn handle_register(
     )
     .await
     {
-        Ok(()) => {}
+        Ok(()) => {
+            // The nonce is consumed: free this peer's rate-limit slot and drop the
+            // key at zero so completed challenge-register cycles cannot pin entries
+            // in peer_nonce_counts forever.
+            release_peer_nonce_slot(&state.peer_nonce_counts, &sp_address.to_string()).await;
+        }
         Err(e) => {
             error!("Nonce claim failed for user {}: {}", user_name, e);
             return (
@@ -1251,11 +1316,12 @@ async fn main() {
     {
         let store = state.nonce_store.clone();
         let counter = state.outstanding_nonces.clone();
+        let counts = state.peer_nonce_counts.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(60));
             loop {
                 interval.tick().await;
-                cleanup_expired_nonces(&store).await;
+                cleanup_expired_nonces(&store, &counts).await;
                 // Reset the global counter to the live store size
                 let size = store.read().await.len() as u64;
                 counter.store(size, Ordering::SeqCst);
@@ -1653,11 +1719,181 @@ mod tests {
             },
         );
 
-        cleanup_expired_nonces(&store).await;
+        let counts: Arc<RwLock<HashMap<String, u32>>> = Arc::new(RwLock::new(HashMap::from([
+            ("sp1qq...".to_string(), 1u32),
+            ("sp1qq2...".to_string(), 1u32),
+        ])));
+        cleanup_expired_nonces(&store, &counts).await;
 
         let store = store.read().await;
         assert!(store.contains_key("fresh"));
         assert!(!store.contains_key("expired"));
+        drop(store);
+
+        // The expired entry's peer dropped to zero and its key must be pruned;
+        // the live peer's key survives with its outstanding count intact.
+        let counts = counts.read().await;
+        assert!(!counts.contains_key("sp1qq..."));
+        assert_eq!(counts.get("sp1qq2..."), Some(&1));
+    }
+
+    #[tokio::test]
+    async fn test_challenge_id_rotation_same_sp_address_hits_peer_cap() {
+        let secp = silentpayments::secp256k1::Secp256k1::new();
+        let scan_secret = silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
+        let spend_secret = silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
+        let sp_addr = make_sp_address(&secp, &scan_secret, &spend_secret);
+        let domain = "danawallet.app";
+
+        let state = register_state(domain);
+        let counts = state.peer_nonce_counts.clone();
+
+        for i in 0..MAX_NONCES_PER_PEER {
+            let resp = handle_challenge(
+                State(Arc::new(state.clone())),
+                Json(ChallengeRequest {
+                    id: format!("rotating-id-{}", i),
+                    domain: domain.to_string(),
+                    user_name: "alice".to_string(),
+                    sp_address: sp_addr.to_string(),
+                }),
+            )
+            .await;
+            assert_eq!(resp.0, StatusCode::OK);
+        }
+
+        let resp = handle_challenge(
+            State(Arc::new(state.clone())),
+            Json(ChallengeRequest {
+                id: "rotating-id-overflow".to_string(),
+                domain: domain.to_string(),
+                user_name: "alice".to_string(),
+                sp_address: sp_addr.to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(resp.0, StatusCode::TOO_MANY_REQUESTS);
+
+        // Rotating request.id never created extra keys: one validated-SP key at the cap.
+        let snap = counts.read().await;
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap.get(&sp_addr.to_string()), Some(&MAX_NONCES_PER_PEER));
+    }
+
+    #[tokio::test]
+    async fn test_challenge_re_mint_after_claim_and_prune() {
+        let secp = silentpayments::secp256k1::Secp256k1::new();
+        let scan_secret = silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
+        let spend_secret = silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
+        let sp_addr = make_sp_address(&secp, &scan_secret, &spend_secret);
+        let domain = "danawallet.app";
+        let peer = sp_addr.to_string();
+
+        let state = register_state(domain);
+        let counts = state.peer_nonce_counts.clone();
+        counts.write().await.insert(peer.clone(), MAX_NONCES_PER_PEER);
+
+        // At the per-peer cap, an honest client cannot mint another challenge.
+        let resp = handle_challenge(
+            State(Arc::new(state.clone())),
+            Json(ChallengeRequest {
+                id: "blocked".to_string(),
+                domain: domain.to_string(),
+                user_name: "alice".to_string(),
+                sp_address: peer.clone(),
+            }),
+        )
+        .await;
+        assert_eq!(resp.0, StatusCode::TOO_MANY_REQUESTS);
+
+        // Complete the challenge-register cycle: the nonce is claimed and the
+        // register flow releases the peer slot (same call handle_register makes).
+        state.nonce_store.write().await.insert(
+            "n1".to_string(),
+            NonceEntry {
+                user_name: "alice".to_string(),
+                sp_address: peer.clone(),
+                domain: domain.to_string(),
+                expires_at: Instant::now() + Duration::from_secs(60),
+            },
+        );
+        state.outstanding_nonces.store(1, Ordering::SeqCst);
+        claim_nonce(&state.nonce_store, &state.outstanding_nonces, "n1", "alice", &peer, domain)
+            .await
+            .expect("claim of a live matching nonce must succeed");
+        release_peer_nonce_slot(&state.peer_nonce_counts, &peer).await;
+
+        // Slot freed: the client can mint again.
+        let resp = handle_challenge(
+            State(Arc::new(state.clone())),
+            Json(ChallengeRequest {
+                id: "re-mint".to_string(),
+                domain: domain.to_string(),
+                user_name: "alice".to_string(),
+                sp_address: peer.clone(),
+            }),
+        )
+        .await;
+        assert_eq!(resp.0, StatusCode::OK);
+        assert_eq!(counts.read().await.get(&peer), Some(&MAX_NONCES_PER_PEER));
+
+        // Releasing every slot to zero must delete the key: the map cannot
+        // accumulate dead per-peer entries from finished cycles.
+        for _ in 0..MAX_NONCES_PER_PEER {
+            release_peer_nonce_slot(&state.peer_nonce_counts, &peer).await;
+        }
+        let snap = counts.read().await;
+        assert!(!snap.contains_key(&peer), "zero-valued peer key must be pruned");
+    }
+
+    #[tokio::test]
+    async fn test_challenge_total_peer_keys_cap_429() {
+        let secp = silentpayments::secp256k1::Secp256k1::new();
+        let scan_secret = silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
+        let spend_secret = silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
+        let sp_addr = make_sp_address(&secp, &scan_secret, &spend_secret);
+        let domain = "danawallet.app";
+
+        // Map full of unrelated peers and a brand-new validated SP address => 429.
+        let state = register_state(domain);
+        {
+            let mut snap = state.peer_nonce_counts.write().await;
+            for i in 0..MAX_TRACKED_PEERS {
+                snap.insert(format!("sp_dummy_{}", i), 1);
+            }
+        }
+        let resp = handle_challenge(
+            State(Arc::new(state.clone())),
+            Json(ChallengeRequest {
+                id: "new-peer".to_string(),
+                domain: domain.to_string(),
+                user_name: "carol".to_string(),
+                sp_address: sp_addr.to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(resp.0, StatusCode::TOO_MANY_REQUESTS);
+
+        // At the same cap, a peer already tracked below max_nonces_per_peer passes.
+        let state2 = register_state(domain);
+        {
+            let mut snap = state2.peer_nonce_counts.write().await;
+            for i in 0..(MAX_TRACKED_PEERS - 1) {
+                snap.insert(format!("sp_dummy_{}", i), 1);
+            }
+            snap.insert(sp_addr.to_string(), 1);
+        }
+        let resp2 = handle_challenge(
+            State(Arc::new(state2)),
+            Json(ChallengeRequest {
+                id: "known-peer".to_string(),
+                domain: domain.to_string(),
+                user_name: "carol".to_string(),
+                sp_address: sp_addr.to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(resp2.0, StatusCode::OK);
     }
 
 
