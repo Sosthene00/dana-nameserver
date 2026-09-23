@@ -16,7 +16,6 @@ use reqwest::Client;
 use silentpayments::{Network as SpNetwork, SilentPaymentCode};
 use dnssec_prover::{query::{ProofBuildingError, build_txt_proof_async}, rr::{Name, RR}, ser::parse_rr_stream, validation::verify_rr_stream};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use std::{net::SocketAddr, str::FromStr, sync::Arc};
 use tokio::sync::RwLock;
@@ -74,8 +73,6 @@ struct AppState {
     nonce_store: Arc<RwLock<HashMap<String, NonceEntry>>>,
     // Per-peer outstanding nonce counts (keyed by the validated SP address string) for rate limiting
     peer_nonce_counts: Arc<RwLock<HashMap<String, u32>>>,
-    // Global outstanding-nonce counter for the aggregate cap
-    outstanding_nonces: Arc<AtomicU64>,
     max_pending_nonces: u64,
     max_nonces_per_peer: u32,
 }
@@ -213,14 +210,25 @@ async fn handle_challenge(
         }
     };
 
-    // Rate limiting: aggregate cap, tracked-peers cap, and per-peer cap are all
-    // evaluated under a single peer_nonce_counts write-lock generation so the
-    // checks cannot straddle two map states (R2 t_24b413be coherence).
+    // Rate limiting: the aggregate cap is measured against the live nonce store
+    // (non-expired entries) and the per-peer caps against peer_nonce_counts, so no
+    // standalone counter can be skewed by a claim/cleanup interleaving
+    // (R2 t_24b413be).
     // The peer key is the validated SP address, never the client-supplied request id.
     let peer = sp_address.to_string();
     {
         let mut counts = state.peer_nonce_counts.write().await;
-        if state.outstanding_nonces.load(Ordering::SeqCst) >= state.max_pending_nonces {
+        // Derive the aggregate pending count from the store itself (live, i.e.
+        // non-expired entries only): no shadow atomics for claim/cleanup
+        // interleavings to desynchronize.
+        let live_pending = state
+            .nonce_store
+            .read()
+            .await
+            .values()
+            .filter(|entry| !entry.is_expired())
+            .count() as u64;
+        if live_pending >= state.max_pending_nonces {
             warn!("Rejecting challenge request: nonce store at capacity");
             return (
                 StatusCode::TOO_MANY_REQUESTS,
@@ -268,7 +276,7 @@ async fn handle_challenge(
     rand::thread_rng().fill_bytes(&mut nonce_bytes);
     let nonce = hex::encode(nonce_bytes);
 
-    // Store the nonce entry and bump the global counter
+    // Store the nonce entry under the write guard
     {
         let mut store = state.nonce_store.write().await;
         store.insert(
@@ -281,7 +289,6 @@ async fn handle_challenge(
             },
         );
     }
-    state.outstanding_nonces.fetch_add(1, Ordering::SeqCst);
 
     let expires_at = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -347,7 +354,6 @@ fn verify_schnorr_signature(
 /// failure the client must request a fresh challenge.
 async fn claim_nonce(
     nonce_store: &Arc<RwLock<HashMap<String, NonceEntry>>>,
-    outstanding_nonces: &AtomicU64,
     nonce: &str,
     user_name: &str,
     sp_address: &str,
@@ -369,8 +375,6 @@ async fn claim_nonce(
     if store.remove(nonce).is_none() {
         return Err("Nonce already consumed or raced. Request a fresh challenge.".to_string());
     }
-    drop(store);
-    outstanding_nonces.fetch_sub(1, Ordering::SeqCst);
     Ok(())
 }
 
@@ -723,7 +727,6 @@ async fn handle_register(
     // request's user_name / SP address / domain.
     match claim_nonce(
         &state.nonce_store,
-        &state.outstanding_nonces,
         &nonce,
         &user_name,
         &sp_address.to_string(),
@@ -1300,7 +1303,6 @@ async fn main() {
         network,
         nonce_store: Arc::new(RwLock::new(HashMap::new())),
         peer_nonce_counts: Arc::new(RwLock::new(HashMap::new())),
-        outstanding_nonces: Arc::new(AtomicU64::new(0)),
         max_pending_nonces: MAX_PENDING_NONCES,
         max_nonces_per_peer: MAX_NONCES_PER_PEER,
     });
@@ -1315,16 +1317,12 @@ async fn main() {
     // Periodically evict expired nonces to bound the in-memory store
     {
         let store = state.nonce_store.clone();
-        let counter = state.outstanding_nonces.clone();
         let counts = state.peer_nonce_counts.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(60));
             loop {
                 interval.tick().await;
                 cleanup_expired_nonces(&store, &counts).await;
-                // Reset the global counter to the live store size
-                let size = store.read().await.len() as u64;
-                counter.store(size, Ordering::SeqCst);
             }
         });
     }
@@ -1611,7 +1609,6 @@ mod tests {
     #[tokio::test]
     async fn test_claim_nonce_single_use() {
         let store: Arc<RwLock<HashMap<String, NonceEntry>>> = Arc::new(RwLock::new(HashMap::new()));
-        let counter = Arc::new(AtomicU64::new(1));
 
         store.write().await.insert(
             "nonce1".to_string(),
@@ -1624,15 +1621,14 @@ mod tests {
         );
 
         assert!(
-            claim_nonce(&store, &counter, "nonce1", "alice", "sp1qq...", "danawallet.app")
+            claim_nonce(&store, "nonce1", "alice", "sp1qq...", "danawallet.app")
                 .await
                 .is_ok()
         );
-        assert_eq!(counter.load(Ordering::SeqCst), 0);
 
         // Single-use: a second claim fails because the nonce was consumed
         assert!(
-            claim_nonce(&store, &counter, "nonce1", "alice", "sp1qq...", "danawallet.app")
+            claim_nonce(&store, "nonce1", "alice", "sp1qq...", "danawallet.app")
                 .await
                 .is_err()
         );
@@ -1641,7 +1637,6 @@ mod tests {
     #[tokio::test]
     async fn test_claim_nonce_mismatch() {
         let store: Arc<RwLock<HashMap<String, NonceEntry>>> = Arc::new(RwLock::new(HashMap::new()));
-        let counter = Arc::new(AtomicU64::new(1));
 
         store.write().await.insert(
             "nonce1".to_string(),
@@ -1655,30 +1650,27 @@ mod tests {
 
         // Wrong user name
         assert!(
-            claim_nonce(&store, &counter, "nonce1", "bob", "sp1qq...", "danawallet.app")
+            claim_nonce(&store, "nonce1", "bob", "sp1qq...", "danawallet.app")
                 .await
                 .is_err()
         );
         // Wrong SP address
         assert!(
-            claim_nonce(&store, &counter, "nonce1", "alice", "sp1qq2...", "danawallet.app")
+            claim_nonce(&store, "nonce1", "alice", "sp1qq2...", "danawallet.app")
                 .await
                 .is_err()
         );
         // Wrong domain
         assert!(
-            claim_nonce(&store, &counter, "nonce1", "alice", "sp1qq...", "example.com")
+            claim_nonce(&store, "nonce1", "alice", "sp1qq...", "example.com")
                 .await
                 .is_err()
         );
-        // Counter is not decremented on failure
-        assert_eq!(counter.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
     async fn test_claim_nonce_expired() {
         let store: Arc<RwLock<HashMap<String, NonceEntry>>> = Arc::new(RwLock::new(HashMap::new()));
-        let counter = Arc::new(AtomicU64::new(1));
 
         store.write().await.insert(
             "nonce1".to_string(),
@@ -1691,7 +1683,7 @@ mod tests {
         );
 
         assert!(
-            claim_nonce(&store, &counter, "nonce1", "alice", "sp1qq...", "danawallet.app")
+            claim_nonce(&store, "nonce1", "alice", "sp1qq...", "danawallet.app")
                 .await
                 .is_err()
         );
@@ -1817,8 +1809,7 @@ mod tests {
                 expires_at: Instant::now() + Duration::from_secs(60),
             },
         );
-        state.outstanding_nonces.store(1, Ordering::SeqCst);
-        claim_nonce(&state.nonce_store, &state.outstanding_nonces, "n1", "alice", &peer, domain)
+        claim_nonce(&state.nonce_store, "n1", "alice", &peer, domain)
             .await
             .expect("claim of a live matching nonce must succeed");
         release_peer_nonce_slot(&state.peer_nonce_counts, &peer).await;
@@ -1933,8 +1924,7 @@ mod tests {
             network: SpNetwork::Mainnet,
             nonce_store: Arc::new(RwLock::new(HashMap::new())),
             peer_nonce_counts: Arc::new(RwLock::new(HashMap::new())),
-            outstanding_nonces: Arc::new(AtomicU64::new(0)),
-            max_pending_nonces: 100,
+                max_pending_nonces: 100,
             max_nonces_per_peer: 10,
         }
     }
