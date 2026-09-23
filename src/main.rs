@@ -27,6 +27,9 @@ use crate::api_structs::{
 };
 
 
+/// The per-name lock map behind AppState.name_locks (see `name_lock`).
+type NameLockMap = Mutex<HashMap<String, Arc<Mutex<()>>>>;
+
 const CLOUDFLARE_API_BASE_URL: &str = "https://api.cloudflare.com/client/v4";
 
 /// Base URL for the Cloudflare API. Defaults to the real API; override with the
@@ -89,7 +92,7 @@ struct AppState {
     peer_nonce_counts: Arc<RwLock<HashMap<String, u32>>>,
     // Per-name async mutexes serialising the check-then-create critical section of
     // /register, keyed by the canonicalised lowercase DNS label (see name_lock).
-    name_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
+    name_locks: Arc<NameLockMap>,
     max_pending_nonces: u64,
     max_nonces_per_peer: u32,
 }
@@ -505,7 +508,7 @@ fn canonical_name_key(user_name: &str) -> String {
 /// locks are never removed, so a guard obtained here always refers to the live
 /// mutex for its name while any holder is inside the critical section.
 async fn name_lock(
-    locks: &Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
+    locks: &Arc<NameLockMap>,
     key: &str,
 ) -> Arc<Mutex<()>> {
     let mut map = locks.lock().await;
