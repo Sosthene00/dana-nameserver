@@ -1878,8 +1878,7 @@ mod tests {
 
     #[test]
     fn test_verify_schnorr_signature_valid() {
-        use silentpayments::secp256k1::{Keypair, Message, Secp256k1, SecretKey};
-        use sha2::{Digest, Sha256};
+        use silentpayments::secp256k1::{Secp256k1, SecretKey};
         use rand::thread_rng;
 
         let secp = Secp256k1::new();
@@ -1888,20 +1887,15 @@ mod tests {
         let sp_addr = make_sp_address(&secp, &scan_secret, &spend_secret);
 
         let message = "dana-register:sp:deadbeef:alice:example.com";
-        let digest = Sha256::digest(message.as_bytes());
-        let msg = Message::from_digest_slice(&digest).unwrap();
 
-        let keypair = Keypair::from_seckey_slice(&secp, &spend_secret.secret_bytes()).unwrap();
-        let sig = secp.sign_schnorr_with_rng(&msg, &keypair, &mut thread_rng());
-        let sig_hex = hex::encode(sig.serialize());
+        let sig_hex = sign_challenge(&secp, &spend_secret, "sp", "deadbeef", "alice", "example.com");
 
         assert!(verify_schnorr_signature(&secp, &sig_hex, message, &sp_addr).is_ok());
     }
 
     #[test]
     fn test_verify_schnorr_signature_invalid() {
-        use silentpayments::secp256k1::{Keypair, Message, Secp256k1, SecretKey};
-        use sha2::{Digest, Sha256};
+        use silentpayments::secp256k1::{Secp256k1, SecretKey};
         use rand::thread_rng;
 
         let secp = Secp256k1::new();
@@ -1910,14 +1904,11 @@ mod tests {
         let sp_addr = make_sp_address(&secp, &scan_secret, &spend_secret);
 
         let message = "dana-register:sp:deadbeef:alice:example.com";
-        let digest = Sha256::digest(message.as_bytes());
-        let msg = Message::from_digest_slice(&digest).unwrap();
 
         // Sign with a different key than the spend key embedded in sp_addr
         let other_secret = SecretKey::new(&mut thread_rng());
-        let keypair = Keypair::from_seckey_slice(&secp, &other_secret.secret_bytes()).unwrap();
-        let sig = secp.sign_schnorr_with_rng(&msg, &keypair, &mut thread_rng());
-        let sig_hex = hex::encode(sig.serialize());
+
+        let sig_hex = sign_challenge(&secp, &other_secret, "sp", "deadbeef", "alice", "example.com");
 
         assert!(verify_schnorr_signature(&secp, &sig_hex, message, &sp_addr).is_err());
 
@@ -2400,6 +2391,22 @@ mod tests {
         );
     }
 
+    fn sign_with_secret(
+        secp: &silentpayments::secp256k1::Secp256k1<silentpayments::secp256k1::All>,
+        spend_secret: &silentpayments::secp256k1::SecretKey,
+        message: &str,
+    ) -> String {
+        use silentpayments::secp256k1::{Keypair, Message};
+        use sha2::{Digest, Sha256};
+        use rand::thread_rng;
+
+        let digest = Sha256::digest(message.as_bytes());
+        let msg = Message::from_digest_slice(&digest).unwrap();
+        let keypair = Keypair::from_seckey_slice(secp, &spend_secret.secret_bytes()).unwrap();
+        let sig = secp.sign_schnorr_with_rng(&msg, &keypair, &mut thread_rng());
+        hex::encode(sig.serialize())
+    }
+
     // Helper: Schnorr-sign the challenge message for a spend secret key.
     fn sign_challenge(
         secp: &silentpayments::secp256k1::Secp256k1<silentpayments::secp256k1::All>,
@@ -2409,16 +2416,8 @@ mod tests {
         user_name: &str,
         domain: &str,
     ) -> String {
-        use silentpayments::secp256k1::{Keypair, Message};
-        use sha2::{Digest, Sha256};
-        use rand::thread_rng;
-
         let message = challenge_message(network_key, nonce, user_name, domain);
-        let digest = Sha256::digest(message.as_bytes());
-        let msg = Message::from_digest_slice(&digest).unwrap();
-        let keypair = Keypair::from_seckey_slice(secp, &spend_secret.secret_bytes()).unwrap();
-        let sig = secp.sign_schnorr_with_rng(&msg, &keypair, &mut thread_rng());
-        hex::encode(sig.serialize())
+        sign_with_secret(secp, spend_secret, &message)
     }
 
     #[tokio::test]
@@ -2895,16 +2894,7 @@ let resp_good = handle_register(
         spend_secret: &silentpayments::secp256k1::SecretKey,
         message: &str,
     ) -> String {
-        use silentpayments::secp256k1::{Keypair, Message, Secp256k1};
-        use sha2::{Digest, Sha256};
-        use rand::thread_rng;
-
-        let secp = Secp256k1::new();
-        let digest = Sha256::digest(message.as_bytes());
-        let msg = Message::from_digest_slice(&digest).unwrap();
-        let keypair = Keypair::from_seckey_slice(&secp, &spend_secret.secret_bytes()).unwrap();
-        let sig = secp.sign_schnorr_with_rng(&msg, &keypair, &mut thread_rng());
-        hex::encode(sig.serialize())
+        sign_with_secret(&silentpayments::secp256k1::Secp256k1::new(), spend_secret, message)
     }
 
     #[tokio::test]
