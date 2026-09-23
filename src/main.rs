@@ -2391,6 +2391,22 @@ mod tests {
         );
     }
 
+    fn sign_with_secret(
+        secp: &silentpayments::secp256k1::Secp256k1<silentpayments::secp256k1::All>,
+        spend_secret: &silentpayments::secp256k1::SecretKey,
+        message: &str,
+    ) -> String {
+        use silentpayments::secp256k1::{Keypair, Message};
+        use sha2::{Digest, Sha256};
+        use rand::thread_rng;
+
+        let digest = Sha256::digest(message.as_bytes());
+        let msg = Message::from_digest_slice(&digest).unwrap();
+        let keypair = Keypair::from_seckey_slice(secp, &spend_secret.secret_bytes()).unwrap();
+        let sig = secp.sign_schnorr_with_rng(&msg, &keypair, &mut thread_rng());
+        hex::encode(sig.serialize())
+    }
+
     // Helper: Schnorr-sign the challenge message for a spend secret key.
     fn sign_challenge(
         secp: &silentpayments::secp256k1::Secp256k1<silentpayments::secp256k1::All>,
@@ -2400,16 +2416,8 @@ mod tests {
         user_name: &str,
         domain: &str,
     ) -> String {
-        use silentpayments::secp256k1::{Keypair, Message};
-        use sha2::{Digest, Sha256};
-        use rand::thread_rng;
-
         let message = challenge_message(network_key, nonce, user_name, domain);
-        let digest = Sha256::digest(message.as_bytes());
-        let msg = Message::from_digest_slice(&digest).unwrap();
-        let keypair = Keypair::from_seckey_slice(secp, &spend_secret.secret_bytes()).unwrap();
-        let sig = secp.sign_schnorr_with_rng(&msg, &keypair, &mut thread_rng());
-        hex::encode(sig.serialize())
+        sign_with_secret(secp, spend_secret, &message)
     }
 
     #[tokio::test]
@@ -2886,16 +2894,7 @@ let resp_good = handle_register(
         spend_secret: &silentpayments::secp256k1::SecretKey,
         message: &str,
     ) -> String {
-        use silentpayments::secp256k1::{Keypair, Message, Secp256k1};
-        use sha2::{Digest, Sha256};
-        use rand::thread_rng;
-
-        let secp = Secp256k1::new();
-        let digest = Sha256::digest(message.as_bytes());
-        let msg = Message::from_digest_slice(&digest).unwrap();
-        let keypair = Keypair::from_seckey_slice(&secp, &spend_secret.secret_bytes()).unwrap();
-        let sig = secp.sign_schnorr_with_rng(&msg, &keypair, &mut thread_rng());
-        hex::encode(sig.serialize())
+        sign_with_secret(&silentpayments::secp256k1::Secp256k1::new(), spend_secret, message)
     }
 
     #[tokio::test]
