@@ -18,7 +18,7 @@ use dnssec_prover::{query::{ProofBuildingError, build_txt_proof_async}, rr::{Nam
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 use std::{net::SocketAddr, str::FromStr, sync::Arc};
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 
 use crate::api_structs::{
     ApiResponse, ChallengeRequest, ChallengeResponse, CloudflareRequest, GetInfoResponse,
@@ -43,6 +43,10 @@ const MAX_NONCES_PER_PEER: u32 = 10;
 // Upper bound on distinct peer keys retained in peer_nonce_counts. A brand-new
 // peer past this cap is refused with 429 until expired/consumed slots are pruned.
 const MAX_TRACKED_PEERS: usize = 1_000;
+// Upper bound on distinct names retained in the per-name registration lock map.
+// Once exceeded, locks not currently held are pruned before inserting a new
+// entrant, so one-shot names cannot grow the map unboundedly.
+const MAX_TRACKED_NAMES: usize = 10_000;
 
 /// A nonce issued by the challenge endpoint. Bound to the user_name / SP
 /// address / domain it was minted for so a later claim must match all three.
@@ -73,6 +77,9 @@ struct AppState {
     nonce_store: Arc<RwLock<HashMap<String, NonceEntry>>>,
     // Per-peer outstanding nonce counts (keyed by the validated SP address string) for rate limiting
     peer_nonce_counts: Arc<RwLock<HashMap<String, u32>>>,
+    // Per-name async mutexes serialising the check-then-create critical section of
+    // /register, keyed by the canonicalised lowercase DNS label (see name_lock).
+    name_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
     max_pending_nonces: u64,
     max_nonces_per_peer: u32,
 }
@@ -436,6 +443,41 @@ async fn cleanup_expired_nonces(
     }
 }
 
+/// Canonical key for the per-name registration lock: DNS labels are
+/// case-insensitive (RFC 1035), so the user name is lowercased before use.
+/// Validation already restricts names to [a-z0-9-], so this never collides
+/// distinct labels.
+fn canonical_name_key(user_name: &str) -> String {
+    user_name.to_lowercase()
+}
+
+/// Get (creating if absent) the per-name mutex guarding the DNS existence check
+/// followed by TXT record creation in /register. Two concurrent, correctly
+/// signed registrations for the same name take the same lock, so the second one
+/// observes the record the first created instead of double-creating it.
+///
+/// The map is capped at MAX_TRACKED_NAMES: when that many names are tracked,
+/// every lock not currently held is pruned before inserting a new entrant. Held
+/// locks are never removed, so a guard obtained here always refers to the live
+/// mutex for its name while any holder is inside the critical section.
+async fn name_lock(
+    locks: &Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
+    key: &str,
+) -> Arc<Mutex<()>> {
+    let mut map = locks.lock().await;
+    if let Some(mtx) = map.get(key) {
+        return mtx.clone();
+    }
+    if map.len() >= MAX_TRACKED_NAMES {
+        // Keep only the locks a live holder is sitting on (try_lock fails while
+        // held); idle entries are dropped to keep the map bounded.
+        map.retain(|_, mtx| mtx.try_lock().is_err());
+    }
+    let mtx = Arc::new(Mutex::new(()));
+    map.insert(key.to_string(), mtx.clone());
+    mtx
+}
+
 async fn fetch_sp_address_from_txt_record(
     user_name: &str,
     domain: &str,
@@ -792,9 +834,71 @@ async fn handle_register(
         user_name, state.domain, nonce
     );
 
+    // R4: the DNS existence check and the Cloudflare TXT create below form a
+    // check-then-create critical section. Two concurrent, correctly signed
+    // registrations for the same name could both observe 'absent' and both POST a
+    // record; authentication does not close that race. Serialise them on a
+    // per-name mutex (canonicalised lowercase label). The guard is scoped to the
+    // check-then-create block only (dropped explicitly below) - never held across
+    // the whole handler - and is taken after signature verification so an
+    // unauthenticated request cannot contend for, or pin, a victim's lock.
+    let held_name = canonical_name_key(&user_name);
+    let name_mutex = name_lock(&state.name_locks, &held_name).await;
+    let _name_guard = name_mutex.lock().await;
+
     let dana_address = format!("{}@{}", user_name, state.domain);
     let txt_name = format!("{}.user._bitcoin-payment.{}", user_name, state.domain);
     let txt_content = format!("bitcoin:?{}={}", network_key, sp_address);
+
+    // R4: still inside the critical section, consult the in-memory registration
+    // maps before the live lookup. A winner that has just created the record may
+    // not be visible yet to a DNSSEC query against the zone, so every follower
+    // must observe the winner's in-process state and take the already-registered
+    // path instead of issuing a second create. The live DNS check below remains
+    // the authoritative source for names registered outside this process.
+    let in_memory_owner = {
+        let dana_map = state.dana_to_sp.read().await;
+        dana_map.get(&dana_address).cloned()
+    };
+    if let Some(existing_sp) = in_memory_owner {
+        if existing_sp == sp_address {
+            // Same owner: refresh the maps and return the existing record, the
+            // same outcome the already-registered-same-SP DNS path produces.
+            let mut sp_map = state.sp_to_dana.write().await;
+            let existing = sp_map.entry(sp_address).or_insert_with(Vec::new);
+            if !existing.contains(&dana_address) {
+                existing.push(dana_address.clone());
+            }
+            drop(sp_map);
+            debug!(
+                "R4: registration for {} already completed by a concurrent request",
+                dana_address
+            );
+            return (
+                StatusCode::OK,
+                AxumJson(RegisterResponse {
+                    id: request.id,
+                    message: "TXT record already exists".to_string(),
+                    dana_address: Some(dana_address),
+                    sp_address: Some(sp_address.to_string()),
+                    dns_record_id: None,
+                }),
+            );
+        }
+        // A different owner claimed this name in-process: same conflict verdict as
+        // the live-check branch, and it can never be overwritten.
+        error!("TXT record already exists for user name: {}", user_name);
+        return (
+            StatusCode::CONFLICT,
+            AxumJson(RegisterResponse {
+                id: request.id,
+                message: "TXT record already exists".to_string(),
+                dana_address: Some(dana_address),
+                sp_address: Some(existing_sp.to_string()),
+                dns_record_id: None,
+            }),
+        );
+    }
 
     // First check if the record already exists using DNS-over-HTTPS
     match fetch_sp_address_from_txt_record(&user_name, &state.domain, sp_address.network())
@@ -931,6 +1035,11 @@ async fn handle_register(
             );
         }
     };
+
+    // End of the check-then-create critical section (early returns above drop
+    // the guard when the handler body returns); release it before building the
+    // success response.
+    drop(_name_guard);
 
     let response_body = RegisterResponse {
         id: request.id,
@@ -1317,6 +1426,7 @@ async fn main() {
         network,
         nonce_store: Arc::new(RwLock::new(HashMap::new())),
         peer_nonce_counts: Arc::new(RwLock::new(HashMap::new())),
+        name_locks: Arc::new(Mutex::new(HashMap::new())),
         max_pending_nonces: MAX_PENDING_NONCES,
         max_nonces_per_peer: MAX_NONCES_PER_PEER,
     });
@@ -1938,9 +2048,125 @@ mod tests {
             network: SpNetwork::Mainnet,
             nonce_store: Arc::new(RwLock::new(HashMap::new())),
             peer_nonce_counts: Arc::new(RwLock::new(HashMap::new())),
+            name_locks: Arc::new(Mutex::new(HashMap::new())),
                 max_pending_nonces: 100,
             max_nonces_per_peer: 10,
         }
+    }
+
+    // ── R4: per-name check-then-create serialisation ──
+    // Two concurrent, correctly-signed /register calls for the same name must
+    // produce exactly ONE Cloudflare POST: the per-name mutex turns the loser into
+    // the already-registered-same-SP path (200 OK, no dns_record_id) instead of a
+    // double create. The .expect(1) on the mock is verified on drop by wiremock.
+    #[tokio::test]
+    async fn test_concurrent_register_same_name_single_create() {
+        let _guard = CF_ENV_LOCK.lock().unwrap();
+        let secp = silentpayments::secp256k1::Secp256k1::new();
+        let scan_secret = silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
+        let spend_secret = silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
+        let sp_addr = make_sp_address(&secp, &scan_secret, &spend_secret);
+        let domain = "danawallet.app";
+        // Random name so the DNS existence check reports absent on the first pass.
+        let user_name = format!("dana_test_user_{}", rand::random::<u64>());
+
+        let m = wiremock::MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/zones/zone-test/dns_records"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(&serde_json::json!({
+                        "success": true,
+                        "result": { "id": "rec-xyz" },
+                    })),
+            )
+            .expect(1)
+            .mount(&m)
+            .await;
+        unsafe { std::env::set_var("CLOUDFLARE_API_BASE_URL", m.uri()); }
+
+        // One shared AppState so both contenders take the same per-name lock.
+        let state = Arc::new(register_state(domain));
+        let sp_str = sp_addr.to_string();
+        // Two clients, two valid single-use nonces, same user_name, same SP address.
+        let nonce_a = "nonce-r4-a";
+        let nonce_b = "nonce-r4-b";
+        make_nonce(
+            &state.nonce_store,
+            nonce_a,
+            &user_name,
+            &sp_str,
+            domain,
+            Instant::now() + Duration::from_secs(60),
+        ).await;
+        make_nonce(
+            &state.nonce_store,
+            nonce_b,
+            &user_name,
+            &sp_str,
+            domain,
+            Instant::now() + Duration::from_secs(60),
+        ).await;
+        let sig_a = sign_challenge(&secp, &spend_secret, "sp", nonce_a, &user_name, domain);
+        let sig_b = sign_challenge(&secp, &spend_secret, "sp", nonce_b, &user_name, domain);
+
+        let req_a = RegisterRequest {
+            id: "req-a".to_string(),
+            domain: domain.to_string(),
+            user_name: Some(user_name.clone()),
+            sp_address: sp_str.clone(),
+            nonce: Some(nonce_a.to_string()),
+            signature: Some(sig_a),
+        };
+        let req_b = RegisterRequest {
+            id: "req-b".to_string(),
+            domain: domain.to_string(),
+            user_name: Some(user_name.clone()),
+            sp_address: sp_str.clone(),
+            nonce: Some(nonce_b.to_string()),
+            signature: Some(sig_b),
+        };
+        let state_a = state.clone();
+        let state_b = state.clone();
+
+        let (ra, rb) = tokio::join!(
+            handle_register(State(state_a), Json(req_a)),
+            handle_register(State(state_b), Json(req_b)),
+        );
+
+        unsafe { std::env::remove_var("CLOUDFLARE_API_BASE_URL"); }
+
+        // Exactly one POST /zones/zone-test/dns_records (double-check of the
+        // verified .expect(1): the winner created, the loser took the existing-
+        // record path).
+        // Exactly one POST /zones/zone-test/dns_records: the winner created, the
+        // follower took the already-registered-same-SP path. Asserted two ways - the
+        // `.expect(1)` expectation is checked by MockServer::verify (and again by its
+        // Drop impl), and the recorded hits are counted explicitly here.
+        m.verify().await;
+        let posts = m
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|r| {
+                r.method.as_str() == "POST"
+                    && r.url.path() == "/zones/zone-test/dns_records"
+            })
+            .count();
+        assert_eq!(posts, 1, "second concurrent registration must not create a TXT record");
+
+        // Both finish authenticated and owner-consistent: winner reports the created
+        // record, loser the already-registered-same-SP outcome (200 OK, no id).
+        assert_eq!(ra.0, StatusCode::OK);
+        assert_eq!(rb.0, StatusCode::OK);
+        let mut ids = vec![ra.1.dns_record_id.clone(), rb.1.dns_record_id.clone()];
+        ids.sort();
+        assert_eq!(
+            ids,
+            vec![None, Some("rec-xyz".to_string())],
+            "exactly one response must carry the created record id"
+        );
     }
 
     // Helper: Schnorr-sign the challenge message for a spend secret key.
