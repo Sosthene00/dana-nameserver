@@ -384,22 +384,19 @@ async fn claim_nonce(
     domain: &str,
 ) -> Result<NonceEntry, String> {
     let mut store = nonce_store.write().await;
-    let entry = match store.get(nonce) {
-        Some(entry) => entry,
+    let claimed = match store.remove(nonce) {
+        Some(claimed) => claimed,
         None => {
             return Err("Invalid or missing nonce. Please call /challenge first.".to_string());
         }
     };
-    if entry.is_expired() {
+    drop(store);
+    if claimed.is_expired() {
         return Err("Challenge nonce expired. Please request a new one.".to_string());
     }
-    if entry.user_name != user_name || entry.sp_address != sp_address || entry.domain != domain {
+    if claimed.user_name != user_name || claimed.sp_address != sp_address || claimed.domain != domain {
         return Err("Nonce does not match this request. Request a new one.".to_string());
     }
-    let claimed = store.remove(nonce).ok_or_else(|| {
-        "Nonce already consumed or raced. Request a fresh challenge.".to_string()
-    })?;
-    drop(store);
     Ok(claimed)
 }
 
