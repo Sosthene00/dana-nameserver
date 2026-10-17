@@ -406,8 +406,11 @@ fn verify_schnorr_signature(
 }
 
 /// Atomically claim a nonce: it must exist, match the user_name / SP address /
-/// domain, and not be expired. Claiming consumes it (single-use); on any later
-/// failure the client must request a fresh challenge.
+/// domain, and not be expired. Claiming consumes it (single-use) ONLY on
+/// success; a claim that ends in Err leaves the entry exactly as it was, so
+/// its mint-time per-peer slot stays releasable (the entry remains visible to
+/// cleanup_expired_nonces, which is the sole release path for entries nobody
+/// ever claims). On success the caller owns the slot and must release it.
 ///
 /// R7 invariant (verify-before-claim): the register handler verifies the
 /// signature over the challenge message BEFORE calling this, so a failed
@@ -415,7 +418,11 @@ fn verify_schnorr_signature(
 /// with a corrected signature until the TTL expires. This is the only place
 /// the nonce is removed, and only after that verification succeeded - the
 /// single `remove` under one write guard is also what makes replay of a
-/// consumed nonce fail the lookup.
+/// consumed nonce fail the lookup. Existence/expiry/binding checks and the
+/// removal share that one guard (t_8457f23e): removing an entry before its
+/// validation runs stranded the peer's +1 whenever the check then rejected
+/// the claim, because a removed entry is invisible to the janitor and the
+/// counter key is pruned only at zero.
 async fn claim_nonce(
     nonce_store: &Arc<RwLock<HashMap<String, NonceEntry>>>,
     nonce: &str,
@@ -424,17 +431,25 @@ async fn claim_nonce(
     domain: &str,
 ) -> Result<NonceEntry, String> {
     let mut store = nonce_store.write().await;
-    let claimed = match store.remove(nonce) {
-        Some(claimed) => claimed,
+    // Clone-then-validate under the guard: a failed claim must not consume the
+    // entry. The guard is held across the checks and the removal, so no other
+    // task can claim or drop the entry between validation and `remove`.
+    let claimed = match store.get(nonce) {
+        Some(claimed) => claimed.clone(),
         None => return Err(ERR_NO_CHALLENGE.to_string()),
     };
-    drop(store);
     if claimed.is_expired() {
         return Err(ERR_EXPIRED.to_string());
     }
     if claimed.user_name != user_name || claimed.sp_address != sp_address || claimed.domain != domain {
         return Err(ERR_MISMATCH.to_string());
     }
+    // Validated under the same write guard: only now does the claim consume
+    // the nonce. The entry cannot have expired or been re-bound between the
+    // checks above and this removal while the guard is held, so the removal
+    // is single-use by construction and replay of a consumed nonce fails the
+    // lookup.
+    store.remove(nonce);
     Ok(claimed)
 }
 
@@ -1965,18 +1980,17 @@ mod tests {
                 .is_err()
         );
 
-        // Positive follow-up (t_846f86e5). Chosen invariant, stated: at this unit
-        // level claim_nonce removes the entry under its single write guard BEFORE
-        // validating the binding, so a mismatched claim consumes the nonce (the
-        // second and third assertions above therefore pass against the entry the
-        // first rejection already removed). The "a mismatched attempt must not
-        // burn the nonce" contract is the handler-level R7 verify-before-claim
-        // invariant, enforced by handle_register's read-only pre-check and
-        // asserted end-to-end in test_register_nonce_minted_for_alice_rejects_bob.
-        // Given a live entry, the correctly-bound claim must succeed - re-mint
-        // nonce1 and pin the happy path to exactly-one successful claim:
-        make_nonce(&store, "nonce1", "alice", "sp1qq...", "danawallet.app",
-                   Instant::now() + Duration::from_secs(60)).await;
+        // Positive follow-up (t_846f86e5). Chosen invariant, stated: claim_nonce
+        // validates existence/expiry/bindings under its single write guard and
+        // removes the entry ONLY when every check passed (t_8457f23e), so a
+        // mismatched claim never consumes the nonce — the second and third
+        // assertions above pass against the still-live entry the first rejection
+        // left in place, matching the handler-level R7 verify-before-claim
+        // contract asserted end-to-end in
+        // test_register_nonce_minted_for_alice_rejects_bob.
+        // Given a live entry, the correctly-bound claim must succeed - nonce1 is
+        // still in place after the three rejections and the happy-path claim
+        // below consumes it exactly once:
         let entry = claim_nonce(&store, "nonce1", "alice", "sp1qq...", "danawallet.app")
             .await
             .expect("correctly-bound claim must succeed while the entry is live");
@@ -3230,6 +3244,205 @@ let resp_good = handle_register(
         assert_eq!(
             state.peer_nonce_counts.read().await.get(&sp_addr.to_string()),
             Some(&1)
+        );
+    }
+
+    // ── t_8457f23e: claim-failure arms must not leak the per-peer slot ──
+    // Failure mode: claim_nonce removes the entry under its write guard BEFORE
+    // validating expiry/bindings, so a claim that ends in Err leaves the
+    // mint-time +1 (handle_challenge) unreleased: cleanup_expired_nonces only
+    // sees store-resident entries and the key is pruned only at zero. The
+    // handler reaches this arm through the sub-microsecond window between the
+    // read-only pre-check and the write guard (no yield point a test can
+    // interleave; a debug run seeding the entry 300ms ahead showed it live at
+    // claim, i.e. the window is unreachable from the outside). These tests
+    // therefore drive the same delegate the race arm delegates to —
+    // claim_nonce's Err path — plus the public-handler pre-check arm, with
+    // deterministic clocks.
+
+    #[tokio::test]
+    async fn test_register_expired_precheck_keeps_slot_releasable_by_janitor() {
+        // The read-only pre-check 401 arm must leave the entry store-resident
+        // so the janitor's release path can reclaim its mint-time slot.
+        let secp = silentpayments::secp256k1::Secp256k1::new();
+        let scan_secret = silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
+        let spend_secret = silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
+        let sp_addr = make_sp_address(&secp, &scan_secret, &spend_secret);
+        let domain = "danawallet.app";
+        let user_name = format!("dana-test-user-{}", rand::random::<u64>());
+        let nonce = "nonce-precheck-stale";
+        let sig = sign_challenge(&secp, &spend_secret, "sp", nonce, &user_name, domain);
+
+        let state = register_state(domain);
+        // Mint-side accounting exactly as handle_challenge would leave it:
+        // resident entry + the peer's +1.
+        make_nonce(
+            &state.nonce_store,
+            nonce,
+            &user_name,
+            &sp_addr.to_string(),
+            domain,
+            Instant::now() - Duration::from_secs(1),
+        )
+        .await;
+        state
+            .peer_nonce_counts
+            .write()
+            .await
+            .insert(sp_addr.to_string(), 1);
+
+        let resp = handle_register(
+            State(Arc::new(state.clone())),
+            Json(RegisterRequest {
+                id: "req-precheck-stale".to_string(),
+                domain: domain.to_string(),
+                user_name: Some(user_name.clone()),
+                sp_address: sp_addr.to_string(),
+                nonce: Some(nonce.to_string()),
+                signature: Some(sig),
+            }),
+        )
+        .await;
+        assert_eq!(resp.0, StatusCode::UNAUTHORIZED);
+        assert_eq!(resp.1.message, ERR_EXPIRED);
+
+        // Read-only arm: the entry must still be resident for the janitor.
+        assert!(
+            state.nonce_store.read().await.contains_key(nonce),
+            "the pre-check expiry rejection must leave the entry store-resident \
+             for cleanup_expired_nonces to release its slot (t_8457f23e)"
+        );
+
+        // The janitor pass that runs in production must then fully release it.
+        cleanup_expired_nonces(&state.nonce_store, &state.peer_nonce_counts).await;
+        assert_eq!(
+            state.peer_nonce_counts.read().await.get(&sp_addr.to_string()),
+            None,
+            "the janitor must prune the pre-check arm's slot once the entry is dropped \
+             (t_8457f23e)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_claim_nonce_expired_failure_releases_peer_slot() {
+        // The claim-failure arm proper (the register race arm delegates here):
+        // a claim ending in Err(EXPIRED) must not leave the mint-time +1
+        // stranded with the entry gone from the store — the exact state in
+        // which no release path can ever reach it again.
+        let secp = silentpayments::secp256k1::Secp256k1::new();
+        let scan_secret = silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
+        let spend_secret = silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
+        let sp_addr = make_sp_address(&secp, &scan_secret, &spend_secret);
+        let domain = "danawallet.app";
+        let user_name = format!("dana-test-user-{}", rand::random::<u64>());
+
+        let state = register_state(domain);
+        let peer = sp_addr.to_string();
+        make_nonce(
+            &state.nonce_store,
+            "n1",
+            &user_name,
+            &peer,
+            domain,
+            Instant::now() - Duration::from_secs(1),
+        )
+        .await;
+        state.peer_nonce_counts.write().await.insert(peer.clone(), 1);
+
+        let err = match claim_nonce(&state.nonce_store, "n1", &user_name, &peer, domain).await {
+            Ok(_) => panic!("an expired nonce must not be claimable"),
+            Err(e) => e,
+        };
+        assert_eq!(err, ERR_EXPIRED.to_string());
+
+        // Whatever the claim arm decided, the pair (entry gone, slot held) is
+        // the leak: only store-residency lets the janitor release it later.
+        cleanup_expired_nonces(&state.nonce_store, &state.peer_nonce_counts).await;
+        assert_eq!(
+            state.peer_nonce_counts.read().await.get(&peer),
+            None,
+            "claim-failure arm leaked the per-peer slot: the mint-time +1 stays stranded \
+             after the entry was removed by the claim (t_8457f23e: permanent peer lockout)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_expired_claim_cycles_do_not_wedge_peer_challenge_cap() {
+        // MAX_NONCES_PER_PEER leaked claim boundaries (the race arm's delegate,
+        // claim_nonce's Err path) must not wedge /challenge at 429 for the
+        // peer, exactly as an at-cap-but-clean peer keeps minting.
+        let secp = silentpayments::secp256k1::Secp256k1::new();
+        let scan_secret = silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
+        let spend_secret = silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
+        let sp_addr = make_sp_address(&secp, &scan_secret, &spend_secret);
+        let domain = "danawallet.app";
+        let user_name = format!("dana-test-user-{}", rand::random::<u64>());
+
+        let state = register_state(domain);
+        let peer = sp_addr.to_string();
+
+        for i in 0..MAX_NONCES_PER_PEER {
+            let mint = handle_challenge(
+                State(Arc::new(state.clone())),
+                Json(ChallengeRequest {
+                    id: format!("wedge-{i}"),
+                    domain: domain.to_string(),
+                    user_name: user_name.clone(),
+                    sp_address: sp_addr.to_string(),
+                }),
+            )
+            .await;
+            assert_eq!(mint.0, StatusCode::OK, "mint {i} must succeed");
+
+            // Cross the nonce past its expiry, then run the exact claim the
+            // register handler performs after its signature gate passes —
+            // claim_nonce's Err(EXPIRED) arm (the race-boundary delegate).
+            let nonce = mint.1.nonce.clone();
+            {
+                let mut store = state.nonce_store.write().await;
+                if let Some(entry) = store.get_mut(&nonce) {
+                    entry.expires_at = Instant::now() - Duration::from_secs(1);
+                }
+            }
+            let err = match claim_nonce(&state.nonce_store, &nonce, &user_name, &peer, domain).await {
+                Ok(_) => panic!("expired nonces must not be claimable"),
+                Err(e) => e,
+            };
+            assert_eq!(err, ERR_EXPIRED.to_string());
+
+            // The janitor pass that runs every 60s in production gets its chance
+            // to release the slot each cycle, exactly like the server's task.
+            cleanup_expired_nonces(&state.nonce_store, &state.peer_nonce_counts).await;
+        }
+
+        // No cycle may leave a phantom slot behind: the peer key must have
+        // been released (pruned at zero) after every rejected claim.
+        let snap = state.peer_nonce_counts.read().await;
+        assert!(
+            !snap.contains_key(&peer),
+            "leaked claim-boundary cycles left peer_nonce_counts[{}] = {:?} after \
+             {MAX_NONCES_PER_PEER} rejected claims (t_8457f23e)",
+            peer,
+            snap.get(&peer)
+        );
+        drop(snap);
+
+        // And the peer must not be locked out of /challenge by phantom counters.
+        let after = handle_challenge(
+            State(Arc::new(state.clone())),
+            Json(ChallengeRequest {
+                id: "after-wedge".to_string(),
+                domain: domain.to_string(),
+                user_name: user_name.clone(),
+                sp_address: sp_addr.to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(
+            after.0,
+            StatusCode::OK,
+            "{MAX_NONCES_PER_PEER} expired-claim boundaries must not wedge /challenge at 429 \
+             for the peer (t_8457f23e)"
         );
     }
 }
