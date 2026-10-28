@@ -32,7 +32,60 @@ const ERR_EXPIRED: &str = "Challenge nonce expired. Please request a new one.";
 const ERR_MISMATCH: &str = "Nonce does not match this request. Request a new one.";
 
 /// The per-name lock map behind AppState.name_locks (see `name_lock`).
-type NameLockMap = Mutex<HashMap<String, Arc<Mutex<()>>>>;
+type NameLockMap = Mutex<HashMap<String, Arc<NameLockEntry>>>;
+
+/// One entry of the per-name registration lock map: the mutex that serialises the
+/// R4 check-then-create section of /register for that name, plus a count of
+/// entrants currently holding a handle to it (see `name_lock`).
+struct NameLockEntry {
+    mutex: Mutex<()>,
+    /// Entrants that were handed this entry and have not finished with it yet -
+    /// everything from the moment `name_lock` returns the handle until that
+    /// handle is dropped. While it is non-zero the entry must not be pruned,
+    /// because its owner still has to lock `mutex` (or is still inside it).
+    pending: std::sync::atomic::AtomicUsize,
+}
+
+impl NameLockEntry {
+    fn new() -> Self {
+        Self {
+            mutex: Mutex::new(()),
+            pending: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    /// Does somebody still rely on this entry? Either an entrant holds a handle
+    /// and has not taken the guard yet, or a holder is inside the critical
+    /// section. `try_lock` also reports Err while other lock operations are
+    /// queued, so a live lock is never mistaken for an idle one.
+    fn in_use(&self) -> bool {
+        self.pending.load(std::sync::atomic::Ordering::SeqCst) > 0
+            || self.mutex.try_lock().is_err()
+    }
+}
+
+/// Handle to a per-name lock entry, returned by `name_lock`. Holding it is what
+/// keeps the entry in the map across the window in which the caller owns the
+/// mutex but has not acquired it yet; dropping the handle ends that claim (a
+/// taken guard drops first and then pins the entry through `try_lock`).
+struct NameLockHandle {
+    entry: Arc<NameLockEntry>,
+}
+
+impl NameLockHandle {
+    /// Acquire the per-name guard. Same shape as `Mutex::lock`, so call-sites
+    /// read unchanged; the entry stays pinned while this handle - and then the
+    /// guard it returns - is alive.
+    async fn lock(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.entry.mutex.lock().await
+    }
+}
+
+impl Drop for NameLockHandle {
+    fn drop(&mut self) {
+        self.entry.pending.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
 
 const CLOUDFLARE_API_BASE_URL: &str = "https://api.cloudflare.com/client/v4";
 
@@ -51,8 +104,9 @@ const MAX_NONCES_PER_PEER: u32 = 10;
 // peer past this cap is refused with 429 until expired/consumed slots are pruned.
 const MAX_TRACKED_PEERS: usize = 1_000;
 // Upper bound on distinct names retained in the per-name registration lock map.
-// Once exceeded, locks not currently held are pruned before inserting a new
-// entrant, so one-shot names cannot grow the map unboundedly.
+// Once exceeded, locks that are neither currently held nor claimed by a pending
+// entrant are pruned before inserting a new entrant, so one-shot names cannot
+// grow the map unboundedly.
 const MAX_TRACKED_NAMES: usize = 10_000;
 
 /// A nonce issued by the challenge endpoint. Bound to the user_name / SP
@@ -521,25 +575,40 @@ fn canonical_name_key(user_name: &str) -> String {
 /// observes the record the first created instead of double-creating it.
 ///
 /// The map is capped at MAX_TRACKED_NAMES: when that many names are tracked,
-/// every lock not currently held is pruned before inserting a new entrant. Held
-/// locks are never removed, so a guard obtained here always refers to the live
-/// mutex for its name while any holder is inside the critical section.
-async fn name_lock(
-    locks: &Arc<NameLockMap>,
-    key: &str,
-) -> Arc<Mutex<()>> {
+/// every lock that is neither currently held nor claimed by a pending entrant is
+/// pruned before a new entrant is inserted. Testing `try_lock` alone is not
+/// enough: the contract here is get-the-handle-then-lock-later - the caller still
+/// has to await this call, and only then `.lock().await` what it returned - so
+/// during that window the entry sits in the map with its mutex unheld. Pruning it
+/// then (as `retain(|_, mtx| mtx.try_lock().is_err())` did) orphaned the entrant's
+/// handle: the next same-name racer get-missed and was handed a FRESH mutex, so
+/// the two holders guarded different mutexes and ran the check-then-create
+/// section concurrently for one name - the exact double-create the per-name lock
+/// exists to prevent. Entries therefore carry a pending-entrant count that the
+/// prune predicate honours, which makes the invariant hold for the whole life of
+/// a handle: a guard obtained here always refers to the live mutex for its name,
+/// from the moment it is handed out until its holder leaves the critical section.
+async fn name_lock(locks: &Arc<NameLockMap>, key: &str) -> NameLockHandle {
     let mut map = locks.lock().await;
-    if let Some(mtx) = map.get(key) {
-        return mtx.clone();
-    }
-    if map.len() >= MAX_TRACKED_NAMES {
-        // Keep only the locks a live holder is sitting on (try_lock fails while
-        // held); idle entries are dropped to keep the map bounded.
-        map.retain(|_, mtx| mtx.try_lock().is_err());
-    }
-    let mtx = Arc::new(Mutex::new(()));
-    map.insert(key.to_string(), mtx.clone());
-    mtx
+    let entry = match map.get(key) {
+        Some(entry) => entry.clone(),
+        None => {
+            if map.len() >= MAX_TRACKED_NAMES {
+                // Keep the locks a live holder is sitting on AND the entries whose
+                // entrant has not taken the guard yet; idle one-shot names go, so
+                // the map stays bounded.
+                map.retain(|_, entry| entry.in_use());
+            }
+            let entry = Arc::new(NameLockEntry::new());
+            map.insert(key.to_string(), entry.clone());
+            entry
+        }
+    };
+    // Counted under the same map guard that the prune runs under, so there is no
+    // window in which the entry is reachable-but-unclaimed: either it is not in
+    // the map yet, or it is and its pending count already covers its entrant.
+    entry.pending.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    NameLockHandle { entry }
 }
 
 async fn fetch_sp_address_from_txt_record(
@@ -3445,4 +3514,106 @@ let resp_good = handle_register(
              for the peer (t_8457f23e)"
         );
     }
+
+    // ---- t_ffa6483f: name_lock cap-path must not prune a pending entrant ----
+    // Red-first regression at bb6aa55c: the MAX_TRACKED_NAMES prune is
+    // `retain(|_, mtx| mtx.try_lock().is_err())`, i.e. drop every mutex nobody
+    // currently HOLDS. The contract is get-Arc-then-lock-later (handle_register
+    // awaits name_lock, and only then .lock().await-s the result), so in that gap
+    // the entrant's Arc sits in the map unheld and a concurrent DIFFERENT-key
+    // cap-path call retains it away; the next same-name racer then get-misses and
+    // guards a FRESH mutex -> two holders, two mutexes, concurrent R4
+    // check-then-create. Fixture entries are built through name_lock itself so the
+    // test does not care what the map value type is.
+    #[tokio::test]
+    async fn test_name_lock_cap_path_keeps_pending_entrant() {
+        let locks: Arc<NameLockMap> = Arc::new(Mutex::new(HashMap::new()));
+        // Fill just under the cap with genuinely-idle foreign names (each token is
+        // dropped at the end of its iteration, so all of them are reclaimable).
+        for i in 0..MAX_TRACKED_NAMES - 1 {
+            let _idle = name_lock(&locks, &format!("idle{i}")).await;
+        }
+        // Entrant A has its handle but has NOT acquired the mutex yet.
+        let a = name_lock(&locks, "alice").await;
+        assert_eq!(locks.lock().await.len(), MAX_TRACKED_NAMES);
+
+        // A concurrent different-key call now trips the cap and prunes.
+        let _b = name_lock(&locks, "bob").await;
+        assert!(
+            locks.lock().await.get("alice").is_some(),
+            "cap-path prune dropped alice's entry while its entrant still holds the handle"
+        );
+        // So a third same-name entrant must observe the very mutex A will lock.
+        let c = name_lock(&locks, "alice").await;
+        assert!(
+            // Same mutex object, not merely an equal-looking new one: this is the
+            // split the cap-path prune used to create.
+            Arc::ptr_eq(&a.entry, &c.entry),
+            "two same-name entrants were handed different mutexes"
+        );
+        // Genuinely-idle entries are still reclaimed, so the cap cannot leak.
+        let map = locks.lock().await;
+        assert!(!map.get("idle0").is_some(), "idle entries must still be reclaimed at the cap");
+        assert!(map.len() <= MAX_TRACKED_NAMES, "map must stay bounded at the cap");
+        drop(map);
+    }
+
+    #[tokio::test]
+    async fn test_name_lock_cap_path_keeps_same_name_entrants_mutually_exclusive() {
+        let locks: Arc<NameLockMap> = Arc::new(Mutex::new(HashMap::new()));
+        for i in 0..MAX_TRACKED_NAMES - 1 {
+            let _idle = name_lock(&locks, &format!("idle{i}")).await;
+        }
+        let a = name_lock(&locks, "alice").await;
+        let _b = name_lock(&locks, "bob").await; // trips the cap-path prune
+        let c = name_lock(&locks, "alice").await;
+
+        // Inject the two R4 critical sections behind the handles the entrants hold
+        // and assert mutual exclusion: at most one inside at any moment.
+        let inside = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let peak = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let ta = {
+            let inside = inside.clone();
+            let peak = peak.clone();
+            tokio::spawn(async move {
+                let _g = a.lock().await;
+                let now = inside.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                peak.fetch_max(now, std::sync::atomic::Ordering::SeqCst);
+                for _ in 0..1000 {
+                    if inside.load(std::sync::atomic::Ordering::SeqCst) >= 2 {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+                inside.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            })
+        };
+        let tc = {
+            let inside = inside.clone();
+            let peak = peak.clone();
+            tokio::spawn(async move {
+                let _g = c.lock().await;
+                let now = inside.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                peak.fetch_max(now, std::sync::atomic::Ordering::SeqCst);
+                for _ in 0..1000 {
+                    if inside.load(std::sync::atomic::Ordering::SeqCst) >= 2 {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+                inside.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            })
+        };
+        let joined = tokio::time::timeout(Duration::from_secs(10), async {
+            let _ = tokio::join!(ta, tc);
+        })
+        .await;
+        assert!(joined.is_ok(), "injected critical sections hung");
+        assert_eq!(
+            peak.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "both same-name entrants were inside the check-then-create section at the same time"
+        );
+    }
+
 }
