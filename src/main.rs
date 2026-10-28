@@ -49,6 +49,8 @@ fn register_http_client() -> Result<Client, reqwest::Error> {
 }
 
 const NONCE_TTL_SECS: u64 = 300; // 5 minutes
+/// Idle-drain period for the nonce janitor (t_fc0840f5).
+const NONCE_JANITOR_INTERVAL_SECS: u64 = 30;
 
 /// Hard deadline for the DNS TXT exists-check round-trip during /register: the
 /// proof build over plain DNS-over-TCP to the configured resolver plus the
@@ -272,6 +274,47 @@ async fn list_bitcoin_records(
     debug!("Received Bitcoin TXT records: {:?}", resp.result);
 
     Ok(resp.result)
+}
+
+/// Full route table, factored out of main() so the HTTP-level regressions
+/// below drive the exact surface the server exposes (t_fc0840f5 flood suite).
+fn build_router(state: Arc<AppState>) -> Router {
+    let v1_router = Router::new()
+        .route("/info", get(handle_get_info))
+        .route("/register", post(handle_register))
+        .route("/register/prepare", post(handle_register_prepare))
+        .route("/lookup", get(handle_lookup_sp_address))
+        .route("/search", get(handle_prefix_search));
+    Router::new().nest("/v1", v1_router).with_state(state)
+}
+
+/// Idle-drain period for the nonce janitor; tests shorten it via
+/// DANA_NONCE_JANITOR_INTERVAL_SECS. The prod default stays well inside
+/// NONCE_TTL_SECS so an idle server cannot sit on a store full of dead nonces.
+fn nonce_janitor_interval_secs() -> u64 {
+    std::env::var("DANA_NONCE_JANITOR_INTERVAL_SECS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .filter(|value| *value >= 1)
+        .unwrap_or(NONCE_JANITOR_INTERVAL_SECS)
+}
+
+/// Drive nonce expiry from the clock instead of only inline at request entry:
+/// an idle process must drain its nonce store without any new request arriving
+/// (t_fc0840f5, parent finding t_b8902a36 — cleanup_expired_nonces used to run
+/// only at the top of prepare/register, so a quiet server never reclaimed).
+/// main() and the HTTP-level tests share this one path so they cannot diverge.
+fn spawn_nonce_janitor(
+    nonce_store: Arc<RwLock<HashMap<String, NonceEntry>>>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut tick =
+            tokio::time::interval(Duration::from_secs(nonce_janitor_interval_secs().max(1)));
+        loop {
+            tick.tick().await;
+            cleanup_expired_nonces(&nonce_store).await;
+        }
+    })
 }
 
 async fn cleanup_expired_nonces(nonce_store: &Arc<RwLock<HashMap<String, NonceEntry>>>) {
@@ -1272,14 +1315,11 @@ async fn main() {
         register_create_lock: Arc::new(tokio::sync::Mutex::new(())),
     });
 
-    let v1_router = Router::new()
-        .route("/info", get(handle_get_info))
-        .route("/register", post(handle_register))
-        .route("/register/prepare", post(handle_register_prepare))
-        .route("/lookup", get(handle_lookup_sp_address))
-        .route("/search", get(handle_prefix_search));
+    // Idle-drain guarantee (t_fc0840f5): expired nonces leave the store on the
+    // clock instead of only when another request happens to arrive.
+    let _nonce_janitor = spawn_nonce_janitor(state.nonce_store.clone());
 
-    let app = Router::new().nest("/v1", v1_router).with_state(state);
+    let app = build_router(state);
 
     let server_addr = format!("{server_host}:{server_port}");
 
@@ -1927,5 +1967,464 @@ async fn test_nonce_claim_rejects_mismatch_and_expired() {
         drop(dana_map);
     }
 
+
+
+    // ───────────────────────────────────────────────────────────────────────
+    // Unauthenticated DoS-class regression for parent finding t_b8902a36
+    // (dev-loop card t_fc0840f5). At base 910d968 /v1/register/prepare is
+    // unauthenticated (router post(...) with no route_layer/middleware) and
+    // every admitted call inserted one NonceEntry keyed by fresh server
+    // randomness, so the store grew attacker_rate x NONCE_TTL_SECS with no
+    // capacity, no per-IP budget, no per-SP budget — and expiry ran only
+    // inline at the next prepare/register, never on an idle process. Under
+    // the release profile's panic = abort, OOM pressure takes /lookup and
+    // /search down with it.
+    //
+    // RED at base: no 429 arm exists and the size asserts blow past every
+    // configured bound; the TTL knob the expiry test needs does not exist
+    // either. GREEN on the capacity/budget commit. The suite runs against the
+    // real router over loopback so the flood walks production HTTP behavior
+    // (JSON bodies, ConnectInfo peer address, the shared janitor).
+    // ───────────────────────────────────────────────────────────────────────
+
+    struct TestServer {
+        addr: SocketAddr,
+        state: Arc<AppState>,
+        tasks: Vec<tokio::task::JoinHandle<()>>,
+    }
+
+    impl Drop for TestServer {
+        fn drop(&mut self) {
+            for task in &self.tasks {
+                task.abort();
+            }
+        }
+    }
+
+    /// Serve the exact main() surface (build_router + janitor) on loopback.
+    async fn spawn_flood_server(state: Arc<AppState>) -> TestServer {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("flood server bind");
+        let addr = listener.local_addr().expect("flood server addr");
+        let serve_state = state.clone();
+        let serve = tokio::spawn(async move {
+            axum::serve(listener, build_router(serve_state))
+                .await
+                .expect("test server");
+        });
+        let janitor = spawn_nonce_janitor(state.nonce_store.clone());
+        TestServer {
+            addr,
+            state,
+            tasks: vec![serve, janitor],
+        }
+    }
+
+    fn flood_state() -> Arc<AppState> {
+        Arc::new(AppState {
+            zone_id: "zone-flood".to_string(),
+            api_token: "tkn-flood".to_string(),
+            domain: "danawallet.app".to_string(),
+            sp_to_dana: Arc::new(RwLock::new(HashMap::new())),
+            dana_to_sp: Arc::new(RwLock::new(HashMap::new())),
+            network: SpNetwork::Testnet,
+            nonce_store: Arc::new(RwLock::new(HashMap::new())),
+            register_create_lock: Arc::new(tokio::sync::Mutex::new(())),
+        })
+    }
+
+    fn flood_prepare_body(
+        id: &str,
+        domain: &str,
+        user_name: &str,
+        sp_address: &str,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "id": id,
+            "domain": domain,
+            "user_name": user_name,
+            "sp_address": sp_address,
+        })
+    }
+
+    async fn post_prepare(addr: SocketAddr, body: &serde_json::Value) -> (u16, serde_json::Value) {
+        let url = format!("http://{}/v1/register/prepare", addr);
+        let resp = reqwest::Client::new()
+            .post(&url)
+            .json(body)
+            .send()
+            .await
+            .expect("prepare round-trip");
+        let code = resp.status().as_u16();
+        let body = resp
+            .json::<serde_json::Value>()
+            .await
+            .expect("prepare json body");
+        (code, body)
+    }
+
+    async fn get_lookup(addr: SocketAddr, sp_address: &str) -> u16 {
+        let url = format!(
+            "http://{}/v1/lookup?sp_address={}&id=live-probe",
+            addr, sp_address
+        );
+        reqwest::Client::new()
+            .get(&url)
+            .send()
+            .await
+            .expect("lookup round-trip")
+            .status()
+            .as_u16()
+    }
+
+    /// (sp address string, signing key) — every call mints a fresh identity so
+    /// a flood can target one key with distinct per-request SP addresses or
+    /// saturate one SP address on purpose.
+    fn fresh_testnet_identity() -> (String, secp256k1::SecretKey) {
+        use secp256k1::{Keypair, PublicKey, Parity, Secp256k1, SecretKey, XOnlyPublicKey};
+        let secp = Secp256k1::new();
+        let sk = SecretKey::new(&mut rand::thread_rng());
+        let kp = Keypair::from_seckey_slice(&secp, sk.as_ref()).expect("keypair");
+        let (x_only, parity) = XOnlyPublicKey::from_keypair(&kp);
+        let mut compressed = [0u8; 33];
+        compressed[0] = match parity {
+            Parity::Even => 2u8,
+            Parity::Odd => 3u8,
+        };
+        compressed[1..].copy_from_slice(&x_only.serialize());
+        let pubkey = PublicKey::from_slice(&compressed).expect("compressed pubkey");
+        let addr = SilentPaymentAddress::new(pubkey, pubkey, SpNetwork::Testnet, 0)
+            .expect("sp address");
+        (addr.to_string(), sk)
+    }
+
+    fn sign_registration(
+        sk: &secp256k1::SecretKey,
+        nonce: &str,
+        user_name: &str,
+        domain: &str,
+    ) -> String {
+        use secp256k1::{Keypair, Message, Secp256k1};
+        use sha2::{Digest, Sha256};
+        let secp = Secp256k1::new();
+        let kp = Keypair::from_seckey_slice(&secp, sk.as_ref()).expect("keypair");
+        let message = format!("dana-register:tsp:{}:{}:{}", nonce, user_name, domain);
+        let digest = Sha256::digest(message.as_bytes());
+        let msg = Message::from_digest_slice(&digest).expect("32-byte digest");
+        let sig = secp.sign_schnorr_with_rng(&msg, &kp, &mut rand::thread_rng());
+        hex::encode(&sig.serialize()[..])
+    }
+
+    fn make_register_request(
+        id: &str,
+        domain: &str,
+        user_name: &str,
+        sp_address: &str,
+        signature: &str,
+        nonce: &str,
+    ) -> RegisterRequest {
+        RegisterRequest {
+            id: id.to_string(),
+            domain: domain.to_string(),
+            user_name: Some(user_name.to_string()),
+            sp_address: sp_address.to_string(),
+            signature: signature.to_string(),
+            nonce: nonce.to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_flood_prepare_store_stops_at_global_cap_and_429s() {
+        let _serial = CF_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        unsafe {
+            std::env::set_var("DANA_NONCE_STORE_MAX_ENTRIES", "16");
+            // Neutralise the per-peer budgets so the GLOBAL cap is what binds.
+            std::env::set_var("DANA_NONCES_PER_IP_MAX_PENDING", "10000");
+            std::env::set_var("DANA_NONCES_PER_SP_MAX_PENDING", "10000");
+        }
+        let srv = spawn_flood_server(flood_state()).await;
+        let domain = "danawallet.app".to_string();
+
+        let mut codes = Vec::new();
+        let mut admitted = 0_u16;
+        let mut refused_429 = 0_u16;
+        for i in 0..24 {
+            let (sp_str, _sk) = fresh_testnet_identity();
+            let body = flood_prepare_body(
+                &format!("gcap-{}", i),
+                &domain,
+                &format!("gcap-u{}", i),
+                &sp_str,
+            );
+            let (code, resp) = post_prepare(srv.addr, &body).await;
+            codes.push(code);
+            if code == 200 && resp["nonce"].as_str().is_some() {
+                admitted += 1;
+            } else if code == 429 {
+                refused_429 += 1;
+            }
+            // The cap must reject, not fault: any 5xx (or a dead server, which
+            // surfaces here as a connection-level panic) is the release-profile
+            // abort scenario this finding is about.
+            assert!(
+                code < 500,
+                "server faulted {} on prepare #{} — the cap must answer 429, never 5xx",
+                code,
+                i
+            );
+        }
+
+        // Store size stops AT the cap and the cap is what refuses.
+        let len = srv.state.nonce_store.read().await.len();
+        assert_eq!(
+            len, 16,
+            "nonce store must stop at the configured cap (codes: {:?})",
+            codes
+        );
+        assert_eq!(admitted, 16, "only cap prepares may be admitted");
+        assert_eq!(refused_429, 8, "every call past the cap must get a 429");
+
+        // /lookup stays up in the same process across the flood.
+        let (probe_sp, _probe_sk) = fresh_testnet_identity();
+        let probe = tokio::time::timeout(Duration::from_secs(10), get_lookup(srv.addr, &probe_sp)).await;
+        assert!(
+            matches!(probe, Ok(code) if code < 500),
+            "/lookup must stay live across the prepare flood, got {:?}",
+            probe
+        );
+
+        drop(srv);
+        unsafe {
+            std::env::remove_var("DANA_NONCE_STORE_MAX_ENTRIES");
+            std::env::remove_var("DANA_NONCES_PER_IP_MAX_PENDING");
+            std::env::remove_var("DANA_NONCES_PER_SP_MAX_PENDING");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_flood_per_ip_budget_caps_one_source_first() {
+        let _serial = CF_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        unsafe {
+            std::env::set_var("DANA_NONCE_STORE_MAX_ENTRIES", "10000");
+            // The whole loop connects from 127.0.0.1 with distinct SP
+            // addresses, so only the per-IP budget can bind here.
+            std::env::set_var("DANA_NONCES_PER_IP_MAX_PENDING", "6");
+            std::env::set_var("DANA_NONCES_PER_SP_MAX_PENDING", "10000");
+        }
+        let srv = spawn_flood_server(flood_state()).await;
+        let domain = "danawallet.app".to_string();
+
+        let mut refused_429 = 0_u16;
+        for i in 0..9 {
+            let (sp_str, _sk) = fresh_testnet_identity();
+            let body =
+                flood_prepare_body(&format!("ip-{}", i), &domain, &format!("ip-u{}", i), &sp_str);
+            let (code, _resp) = post_prepare(srv.addr, &body).await;
+            assert!(code < 500, "peer budget overrun must 429, not fault ({})", code);
+            if code == 429 {
+                refused_429 += 1;
+            }
+        }
+        let len = srv.state.nonce_store.read().await.len();
+        assert_eq!(len, 6, "one source must stop at its per-IP budget");
+        assert_eq!(refused_429, 3, "calls past the per-IP budget must 429");
+        drop(srv);
+        unsafe {
+            std::env::remove_var("DANA_NONCE_STORE_MAX_ENTRIES");
+            std::env::remove_var("DANA_NONCES_PER_IP_MAX_PENDING");
+            std::env::remove_var("DANA_NONCES_PER_SP_MAX_PENDING");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_flood_per_sp_budget_caps_one_address_first() {
+        let _serial = CF_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        unsafe {
+            std::env::set_var("DANA_NONCE_STORE_MAX_ENTRIES", "10000");
+            std::env::set_var("DANA_NONCES_PER_IP_MAX_PENDING", "10000");
+            std::env::set_var("DANA_NONCES_PER_SP_MAX_PENDING", "3");
+        }
+        let srv = spawn_flood_server(flood_state()).await;
+        let domain = "danawallet.app".to_string();
+        let (shared_sp, _sk) = fresh_testnet_identity();
+
+        let mut refused_429 = 0_u16;
+        for i in 0..6 {
+            let body = flood_prepare_body(&format!("sp-{}", i), &domain, "sp-u", &shared_sp);
+            let (code, _resp) = post_prepare(srv.addr, &body).await;
+            assert!(code < 500, "SP budget overrun must 429, not fault ({})", code);
+            if code == 429 {
+                refused_429 += 1;
+            }
+        }
+        let len = srv.state.nonce_store.read().await.len();
+        assert_eq!(len, 3, "one SP address must stop at its budget");
+        assert_eq!(refused_429, 3, "calls past the SP budget must 429");
+        drop(srv);
+        unsafe {
+            std::env::remove_var("DANA_NONCE_STORE_MAX_ENTRIES");
+            std::env::remove_var("DANA_NONCES_PER_IP_MAX_PENDING");
+            std::env::remove_var("DANA_NONCES_PER_SP_MAX_PENDING");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_flood_entries_expire_on_the_clock_without_followup_request() {
+        let _serial = CF_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        unsafe {
+            std::env::set_var("DANA_NONCE_TTL_SECS", "1");
+            std::env::set_var("DANA_NONCE_JANITOR_INTERVAL_SECS", "1");
+        }
+        let srv = spawn_flood_server(flood_state()).await;
+        let domain = "danawallet.app".to_string();
+
+        let mut issued = 0_u16;
+        for i in 0..3 {
+            let (sp_str, _sk) = fresh_testnet_identity();
+            let body = flood_prepare_body(
+                &format!("exp-{}", i),
+                &domain,
+                &format!("exp-u{}", i),
+                &sp_str,
+            );
+            let (code, _resp) = post_prepare(srv.addr, &body).await;
+            assert_eq!(code, 200, "normal prepares below every budget must pass");
+            issued += 1;
+        }
+        assert_eq!(issued, 3);
+        assert_eq!(srv.state.nonce_store.read().await.len(), 3);
+
+        // NO further HTTP request is sent: only the janitor can now clear the
+        // store. Base only reclaimed inline at the next prepare/register, so a
+        // quiet server kept dead entries until traffic returned (pre-fix RED).
+        let drained = tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                if srv.state.nonce_store.read().await.len() == 0 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+        })
+        .await;
+        assert!(
+            drained.is_ok(),
+            "idle nonce store never drained without a follow-up request — expiry must \
+             run on the janitor timer, not only inline at request entry (pre-fix RED state)"
+        );
+
+        drop(srv);
+        unsafe {
+            std::env::remove_var("DANA_NONCE_TTL_SECS");
+            std::env::remove_var("DANA_NONCE_JANITOR_INTERVAL_SECS");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_flood_legit_nonce_survives_the_pressure_and_lookup_stays_up() {
+        let _serial = CF_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let stub = spawn_stalling_cloudflare_stub();
+        unsafe {
+            std::env::set_var("CLOUDFLARE_API_BASE_URL", format!("http://{}", stub));
+            std::env::set_var("DANA_NONCE_STORE_MAX_ENTRIES", "12");
+            std::env::set_var("DANA_NONCES_PER_IP_MAX_PENDING", "10000");
+            std::env::set_var("DANA_NONCES_PER_SP_MAX_PENDING", "10000");
+        }
+        let srv = spawn_flood_server(flood_state()).await;
+        let domain = "danawallet.app".to_string();
+
+        // (a) The client's legitimate prepare (first below every bound) issues a nonce.
+        let (sp_str, sk) = fresh_testnet_identity();
+        let user = "flood-live-u";
+        let body = flood_prepare_body("live", &domain, user, &sp_str);
+        let (code, resp) = post_prepare(srv.addr, &body).await;
+        assert_eq!(code, 200, "legitimate prepare must be admitted");
+        let nonce = resp["nonce"]
+            .as_str()
+            .expect("legitimate prepare must return a nonce")
+            .to_string();
+
+        // (b) Flood past the cap with unrelated identities from the same source.
+        let mut junk_429 = 0_u16;
+        for i in 0..20 {
+            let (junk_sp, _junk_sk) = fresh_testnet_identity();
+            let junk_body =
+                flood_prepare_body(&format!("junk-{}", i), &domain, &format!("junk-u{}", i), &junk_sp);
+            let (junk_code, _junk_resp) = post_prepare(srv.addr, &junk_body).await;
+            assert!(junk_code < 500, "junk prepare faulted {}", junk_code);
+            if junk_code == 429 {
+                junk_429 += 1;
+            }
+        }
+        assert!(junk_429 > 0, "the saturated store must start refusing with 429");
+        assert_eq!(
+            srv.state.nonce_store.read().await.len(),
+            12,
+            "live entry + junk must stop at the cap"
+        );
+
+        // (c) /lookup answers from the same process while the store is jammed.
+        let (probe_sp, _probe_sk) = fresh_testnet_identity();
+        let probe = tokio::time::timeout(Duration::from_secs(10), get_lookup(srv.addr, &probe_sp)).await;
+        assert!(
+            matches!(probe, Ok(code) if code < 500),
+            "/lookup must stay live while the nonce store is at capacity, got {:?}",
+            probe
+        );
+
+        // (d) The legitimately issued nonce still validates for its registration
+        // despite the flood — junk never evicted it and the cap never blocks a
+        // nonce already in the user's hand.
+        let sig = sign_registration(&sk, &nonce, user, &domain);
+        let req = make_register_request("live-reg", &domain, user, &sp_str, &sig, &nonce);
+        let state = srv.state.clone();
+        let drive = tokio::time::timeout(Duration::from_secs(60), handle_register(State(state), Json(req))).await;
+        let (reg_status, reg_body) = match drive {
+            Err(_elapsed) => panic!(
+                "live /register hung under flood pressure (pre-fix RED state): {:?}",
+                _elapsed
+            ),
+            Ok(pair) => pair,
+        };
+        assert_eq!(
+            reg_status,
+            StatusCode::OK,
+            "flood pressure must not invalidate a legitimately issued nonce: {}",
+            reg_body.0.message
+        );
+        assert_eq!(
+            reg_body.0.dns_record_id.as_deref().map(|s| &s[..]),
+            Some("rec-stub-ok"),
+            "live registration must complete through the bounded stub"
+        );
+
+        // (e) Single-use still holds after the flood: replay is refused.
+        let replay_sig = sign_registration(&sk, &nonce, user, &domain);
+        let replay = make_register_request("live-reg-2", &domain, user, &sp_str, &replay_sig, &nonce);
+        let (replay_status, _replay_body) = handle_register(State(srv.state.clone()), Json(replay)).await;
+        assert_eq!(
+            replay_status,
+            StatusCode::BAD_REQUEST,
+            "a flooded store must not revive a consumed nonce"
+        );
+
+        drop(srv);
+        unsafe {
+            std::env::remove_var("CLOUDFLARE_API_BASE_URL");
+            std::env::remove_var("DANA_NONCE_STORE_MAX_ENTRIES");
+            std::env::remove_var("DANA_NONCES_PER_IP_MAX_PENDING");
+            std::env::remove_var("DANA_NONCES_PER_SP_MAX_PENDING");
+        }
+    }
 
 }
