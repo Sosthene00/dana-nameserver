@@ -3,7 +3,7 @@ mod api_structs;
 use anyhow::Result;
 use axum::{
     Json, Router,
-    extract::{Query, State},
+    extract::{ConnectInfo, Query, State},
     http::StatusCode,
     response::Json as AxumJson,
     routing::{get, post},
@@ -17,7 +17,7 @@ use reqwest::Client;
 use silentpayments::{Network as SpNetwork, SilentPaymentAddress};
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
-use std::{net::SocketAddr, str::FromStr, sync::Arc};
+use std::{net::{IpAddr, SocketAddr}, str::FromStr, sync::Arc};
 use tokio::sync::RwLock;
 
 use crate::api_structs::{
@@ -52,6 +52,181 @@ const NONCE_TTL_SECS: u64 = 300; // 5 minutes
 /// Idle-drain period for the nonce janitor (t_fc0840f5).
 const NONCE_JANITOR_INTERVAL_SECS: u64 = 30;
 
+/// Hard capacity of the challenge-response nonce store. /register/prepare is
+/// unauthenticated, so without a ceiling the store size is bounded only by the
+/// attacker's request rate x the nonce TTL: every admitted call buys a 32-byte
+/// RNG draw, a hex encode, an SP-address parse and three heap Strings (parent
+/// finding t_b8902a36, card t_fc0840f5). Under the release profile's
+/// panic = abort, OOM pressure takes the whole process down with it — /lookup
+/// and /search die too — so the store needs a hard ceiling plus per-peer
+/// budgets. Env overrides exist for the tests, mirroring the
+/// CLOUDFLARE_API_BASE_URL hook precedent.
+const NONCE_STORE_MAX_ENTRIES: usize = 10_000;
+/// Pending-nonce budget per peer IP (binds before the global ceiling).
+const NONCES_PER_IP_MAX_PENDING: usize = 64;
+/// Pending-nonce budget per SP address (binds before the global ceiling).
+const NONCES_PER_SP_MAX_PENDING: usize = 16;
+
+fn env_usize(key: &str, default: usize) -> usize {
+    std::env::var(key)
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(default)
+}
+
+fn env_u64(key: &str, default: u64) -> u64 {
+    std::env::var(key)
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(default)
+}
+
+fn nonce_store_max_entries() -> usize {
+    env_usize("DANA_NONCE_STORE_MAX_ENTRIES", NONCE_STORE_MAX_ENTRIES)
+}
+
+fn nonces_per_ip_max_pending() -> usize {
+    env_usize("DANA_NONCES_PER_IP_MAX_PENDING", NONCES_PER_IP_MAX_PENDING)
+}
+
+fn nonces_per_sp_max_pending() -> usize {
+    env_usize("DANA_NONCES_PER_SP_MAX_PENDING", NONCES_PER_SP_MAX_PENDING)
+}
+
+fn nonce_ttl_secs() -> u64 {
+    env_u64("DANA_NONCE_TTL_SECS", NONCE_TTL_SECS).max(1)
+}
+
+/// Effective issuance limits, read per request like the other test hooks.
+struct NonceCaps {
+    max_entries: usize,
+    per_ip_max: usize,
+    per_sp_max: usize,
+}
+
+impl NonceCaps {
+    fn from_env() -> Self {
+        Self {
+            max_entries: nonce_store_max_entries().max(1),
+            per_ip_max: nonces_per_ip_max_pending().max(1),
+            per_sp_max: nonces_per_sp_max_pending().max(1),
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum IssueError {
+    /// Global ceiling reached.
+    GlobalFull,
+    /// Peer IP's pending-nonce budget exhausted.
+    IpFull,
+    /// SP address's pending-nonce budget exhausted.
+    SpFull,
+}
+
+/// The nonce store with its per-peer bookkeeping behind ONE lock, so a capped
+/// entry can never strand a peer counter: every mutation runs under the same
+/// write guard and the counters are re-derived from `entries` on every reap
+/// (the single source of truth is `entries`; the maps are a pure index).
+#[derive(Default)]
+struct NonceStore {
+    entries: HashMap<String, NonceEntry>,
+    per_ip: HashMap<IpAddr, usize>,
+    per_sp: HashMap<String, usize>,
+}
+
+fn dec_counter<K: std::hash::Hash + std::cmp::Eq>(counters: &mut HashMap<K, usize>, key: &K) {
+    if let Some(count) = counters.get_mut(key) {
+        *count = count.saturating_sub(1);
+    }
+}
+
+impl NonceStore {
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    fn get(&self, nonce: &str) -> Option<&NonceEntry> {
+        self.entries.get(nonce)
+    }
+
+    fn put(&mut self, nonce: String, entry: NonceEntry) {
+        *self.per_ip.entry(entry.issued_to_ip).or_insert(0) += 1;
+        *self.per_sp.entry(entry.sp_address.clone()).or_insert(0) += 1;
+        self.entries.insert(nonce, entry);
+    }
+
+    fn remove(&mut self, nonce: &str) -> Option<NonceEntry> {
+        let entry = self.entries.remove(nonce)?;
+        dec_counter(&mut self.per_ip, &entry.issued_to_ip);
+        dec_counter(&mut self.per_sp, &entry.sp_address);
+        Some(entry)
+    }
+
+    /// Check all three budgets and insert inside the caller's single write
+    /// guard: a racing prepare cannot interleave the two, so the store stops
+    /// AT the cap and the counters cannot drift. The RNG draw and the entry's
+    /// heap work happen only once the call is admitted, so a refused flood
+    /// request pays no per-entry allocation cost either.
+    fn issue(
+        &mut self,
+        peer_ip: IpAddr,
+        user_name: &str,
+        sp_address: &str,
+        domain: &str,
+        ttl_secs: u64,
+        caps: &NonceCaps,
+    ) -> Result<String, IssueError> {
+        if self.entries.len() >= caps.max_entries {
+            return Err(IssueError::GlobalFull);
+        }
+        if self.per_ip.get(&peer_ip).copied().unwrap_or(0) >= caps.per_ip_max {
+            return Err(IssueError::IpFull);
+        }
+        if self.per_sp.get(sp_address).copied().unwrap_or(0) >= caps.per_sp_max {
+            return Err(IssueError::SpFull);
+        }
+        let mut nonce_bytes = [0u8; 32];
+        rand::thread_rng().fill_bytes(&mut nonce_bytes);
+        let nonce_hex = hex::encode(nonce_bytes);
+        self.put(
+            nonce_hex.clone(),
+            NonceEntry {
+                user_name: user_name.to_string(),
+                sp_address: sp_address.to_string(),
+                domain: domain.to_string(),
+                issued_to_ip: peer_ip,
+                expires_at: Instant::now() + Duration::from_secs(ttl_secs),
+            },
+        );
+        Ok(nonce_hex)
+    }
+
+    fn reap_expired(&mut self) -> usize {
+        let mut reaped = 0_usize;
+        self.entries.retain(|_, entry| {
+            if entry.is_expired() {
+                reaped += 1;
+                false
+            } else {
+                true
+            }
+        });
+        if reaped > 0 {
+            // Re-derive the index from the survivors: counters and store cannot
+            // diverge even if a path is ever added that drops entries.
+            self.per_ip.clear();
+            self.per_sp.clear();
+            for entry in self.entries.values() {
+                *self.per_ip.entry(entry.issued_to_ip).or_insert(0) += 1;
+                *self.per_sp.entry(entry.sp_address.clone()).or_insert(0) += 1;
+            }
+        }
+        reaped
+    }
+}
+
 /// Hard deadline for the DNS TXT exists-check round-trip during /register: the
 /// proof build over plain DNS-over-TCP to the configured resolver plus the
 /// follow-up HRN resolution. Expiry fails only that one request (503) and
@@ -69,6 +244,10 @@ struct NonceEntry {
     user_name: String,
     sp_address: String,
     domain: String,
+    /// OS-reported TCP peer address the entry was issued to — the key of the
+    /// per-IP budget (ConnectInfo, not a forgeable header; see
+    /// handle_register_prepare).
+    issued_to_ip: IpAddr,
     expires_at: Instant,
 }
 
@@ -87,8 +266,10 @@ struct AppState {
     dana_to_sp: Arc<RwLock<HashMap<String, SilentPaymentAddress>>>,
     // we only accept registration requests from this network
     network: SpNetwork,
-    // Challenge-response nonce store for signature auth
-    nonce_store: Arc<RwLock<HashMap<String, NonceEntry>>>,
+    // Challenge-response nonce store for signature auth: entries plus their
+    // per-IP/per-SP budget index behind ONE lock, capacity-bounded at issue and
+    // reaped by the janitor on the clock (t_fc0840f5).
+    nonce_store: Arc<RwLock<NonceStore>>,
     // Serializes DNS exists-check + TXT creation so concurrent registrations
     // cannot both see "absent" and both create a record (MODERATE-5).
     // Hold time is bounded: every outbound call made under the guard carries a hard
@@ -305,7 +486,7 @@ fn nonce_janitor_interval_secs() -> u64 {
 /// only at the top of prepare/register, so a quiet server never reclaimed).
 /// main() and the HTTP-level tests share this one path so they cannot diverge.
 fn spawn_nonce_janitor(
-    nonce_store: Arc<RwLock<HashMap<String, NonceEntry>>>,
+    nonce_store: Arc<RwLock<NonceStore>>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut tick =
@@ -317,14 +498,23 @@ fn spawn_nonce_janitor(
     })
 }
 
-async fn cleanup_expired_nonces(nonce_store: &Arc<RwLock<HashMap<String, NonceEntry>>>) {
-    let mut store = nonce_store.write().await;
-    store.retain(|_, entry| !entry.is_expired());
+async fn cleanup_expired_nonces(nonce_store: &Arc<RwLock<NonceStore>>) {
+    nonce_store.write().await.reap_expired();
 }
 
-/// Prepare a nonce for challenge-response registration authentication
+/// Prepare a nonce for challenge-response registration authentication.
+///
+/// The route is unauthenticated, so issuance is capped by the store's global
+/// ceiling plus per-IP and per-SP-address budgets; past a budget the call is
+/// refused with 429 (a plain refusal — never a panic or 5xx). The peer key is
+/// ConnectInfo's OS-reported TCP socket address: this service has no
+/// tower-http/TrustedProxy layer and never trusts X-Forwarded-For, so a
+/// header-derived key would be attacker-chosen (forgeable). The socket peer
+/// can only be forged by whoever owns the real return path — the exact
+/// identity the per-IP budget is meant to meter.
 async fn handle_register_prepare(
     State(state): State<Arc<AppState>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     Json(request): Json<RegisterPrepareRequest>,
 ) -> (StatusCode, AxumJson<RegisterPrepareResponse>) {
     // Bound the in-memory nonce store by evicting expired entries
@@ -409,29 +599,52 @@ async fn handle_register_prepare(
         );
     }
 
-    // Clean up expired nonces
-    cleanup_expired_nonces(&state.nonce_store).await;
-
-    // Generate a 32-byte random nonce
-    let mut nonce_bytes = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut nonce_bytes);
-    let nonce_hex = hex::encode(nonce_bytes);
-
-    // Store the nonce in the nonce store
-    let nonce_entry = NonceEntry {
-        user_name: user_name.clone(),
-        sp_address: sp_address.to_string(),
-        domain: state.domain.clone(),
-        expires_at: Instant::now() + Duration::from_secs(NONCE_TTL_SECS),
+    // Single source of truth for the size/budget decision: the cap checks and
+    // the insert share one write guard (NonceStore::issue), so concurrent
+    // prepares cannot overshoot the cap and the peer counters cannot strand.
+    let peer_ip = peer.ip();
+    let caps = NonceCaps::from_env();
+    let ttl_secs = nonce_ttl_secs();
+    let issued = {
+        let mut store = state.nonce_store.write().await;
+        store.issue(
+            peer_ip,
+            &user_name,
+            request.sp_address.as_str(),
+            &state.domain,
+            ttl_secs,
+            &caps,
+        )
     };
-
-    let mut store = state.nonce_store.write().await;
-    store.insert(nonce_hex.clone(), nonce_entry);
-    drop(store);
+    let nonce_hex = match issued {
+        Ok(nonce_hex) => nonce_hex,
+        Err(kind) => {
+            let reason = match kind {
+                IssueError::GlobalFull => {
+                    "nonce store is at capacity; retry once older nonces have expired"
+                }
+                IssueError::IpFull => "too many pending registration nonces from this address",
+                IssueError::SpFull => "too many pending registration nonces for this SP address",
+            };
+            warn!(
+                "Nonce issuance refused for {}@{} from {}: {}",
+                user_name, state.domain, peer_ip, reason
+            );
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                AxumJson(RegisterPrepareResponse {
+                    id: request.id,
+                    message: format!("Registration rate limit reached: {}", reason),
+                    nonce: None,
+                    error: Some("nonce_budget_exhausted".to_string()),
+                }),
+            );
+        }
+    };
 
     info!(
         "Generated nonce for user {} on domain {} (expires in {}s)",
-        user_name, state.domain, NONCE_TTL_SECS
+        user_name, state.domain, ttl_secs
     );
 
     (
@@ -506,7 +719,7 @@ fn verify_schnorr_signature(
 /// write lock; the nonce is single-use — on any later failure the client must
 /// call `/register/prepare` again.
 async fn claim_nonce(
-    nonce_store: &Arc<RwLock<HashMap<String, NonceEntry>>>,
+    nonce_store: &Arc<RwLock<NonceStore>>,
     nonce: &str,
     user_name: &str,
     sp_address: &str,
@@ -1154,8 +1367,7 @@ async fn main() {
         Arc::new(RwLock::new(HashMap::new()));
     let dana_to_sp: Arc<RwLock<HashMap<String, SilentPaymentAddress>>> =
         Arc::new(RwLock::new(HashMap::new()));
-    let nonce_store: Arc<RwLock<HashMap<String, NonceEntry>>> =
-        Arc::new(RwLock::new(HashMap::new()));
+    let nonce_store: Arc<RwLock<NonceStore>> = Arc::new(RwLock::new(NonceStore::default()));
 
     // Populate the maps of sp addresses to dana addresses and vice versa on startup
     info!("Populating SP address to Dana address maps from Cloudflare records...");
@@ -1333,7 +1545,9 @@ async fn main() {
     info!("API endpoint available at: http://{server_addr}/v1/lookup");
     info!("API endpoint available at: http://{server_addr}/v1/search");
 
-    axum::serve(listener, app)
+    // ConnectInfo (used by the bounded prepare handler) is only populated
+    // when the app is served through into_make_service_with_connect_info().
+    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
         .await
         .expect("Failed to start server");
 }
@@ -1472,6 +1686,7 @@ mod tests {
             user_name: "test".into(),
             sp_address: "sp1test".into(),
             domain: "test.com".into(),
+            issued_to_ip: "203.0.113.7".parse().unwrap(),
             expires_at: Instant::now() - Duration::from_secs(1),
         };
         assert!(expired.is_expired());
@@ -1480,6 +1695,7 @@ mod tests {
             user_name: "test".into(),
             sp_address: "sp1test".into(),
             domain: "test.com".into(),
+            issued_to_ip: "203.0.113.7".parse().unwrap(),
             expires_at: Instant::now() + Duration::from_secs(300),
         };
         assert!(!fresh.is_expired());
@@ -1493,7 +1709,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_txt_record_mock_success() {
-        let _guard = CF_ENV_LOCK.lock().unwrap();
+        let _guard = CF_ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
         let m = MockServer::start().await;
         let zone = "testzone123";
         let token = "test-token";
@@ -1529,7 +1745,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_txt_record_mock_no_id() {
-        let _guard = CF_ENV_LOCK.lock().unwrap();
+        let _guard = CF_ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
         let m = MockServer::start().await;
         let zone = "testzone456";
         let token = "test-token2";
@@ -1556,7 +1772,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_txt_record_mock_error_status() {
-        let _guard = CF_ENV_LOCK.lock().unwrap();
+        let _guard = CF_ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
         let m = MockServer::start().await;
         let zone = "testzone789";
         let token = "test-token3";
@@ -1578,7 +1794,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_list_bitcoin_records_mock() {
-        let _guard = CF_ENV_LOCK.lock().unwrap();
+        let _guard = CF_ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
         let m = MockServer::start().await;
         let zone = "testzone000";
         let token = "test-token4";
@@ -1617,13 +1833,14 @@ mod tests {
 
 #[tokio::test]
 async fn test_nonce_claim_is_atomic() {
-    let store = std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
-    store.write().await.insert(
+    let store = std::sync::Arc::new(tokio::sync::RwLock::new(NonceStore::default()));
+    store.write().await.put(
         "n1".to_string(),
         super::NonceEntry {
             user_name: "alice".into(),
             sp_address: "sp1alice".into(),
             domain: "test.com".into(),
+            issued_to_ip: "203.0.113.7".parse().unwrap(),
             expires_at: std::time::Instant::now() + std::time::Duration::from_secs(300),
         },
     );
@@ -1637,13 +1854,14 @@ async fn test_nonce_claim_is_atomic() {
 
 #[tokio::test]
 async fn test_nonce_claim_is_single_use() {
-    let store = std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
-    store.write().await.insert(
+    let store = std::sync::Arc::new(tokio::sync::RwLock::new(NonceStore::default()));
+    store.write().await.put(
         "n1".to_string(),
         super::NonceEntry {
             user_name: "alice".into(),
             sp_address: "sp1alice".into(),
             domain: "test.com".into(),
+            issued_to_ip: "203.0.113.7".parse().unwrap(),
             expires_at: std::time::Instant::now() + std::time::Duration::from_secs(300),
         },
     );
@@ -1661,13 +1879,14 @@ async fn test_nonce_claim_is_single_use() {
 
 #[tokio::test]
 async fn test_nonce_claim_rejects_mismatch_and_expired() {
-    let store = std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
-    store.write().await.insert(
+    let store = std::sync::Arc::new(tokio::sync::RwLock::new(NonceStore::default()));
+    store.write().await.put(
         "n1".to_string(),
         super::NonceEntry {
             user_name: "alice".into(),
             sp_address: "sp1alice".into(),
             domain: "test.com".into(),
+            issued_to_ip: "203.0.113.7".parse().unwrap(),
             expires_at: std::time::Instant::now() + std::time::Duration::from_secs(300),
         },
     );
@@ -1681,12 +1900,13 @@ async fn test_nonce_claim_rejects_mismatch_and_expired() {
     assert!(legit.is_ok());
 
     // An expired nonce is rejected.
-    store.write().await.insert(
+    store.write().await.put(
         "n2".to_string(),
         super::NonceEntry {
             user_name: "alice".into(),
             sp_address: "sp1alice".into(),
             domain: "test.com".into(),
+            issued_to_ip: "203.0.113.7".parse().unwrap(),
             expires_at: std::time::Instant::now() - std::time::Duration::from_secs(1),
         },
     );
@@ -1797,18 +2017,19 @@ async fn test_nonce_claim_rejects_mismatch_and_expired() {
             sp_to_dana: Arc::new(RwLock::new(HashMap::new())),
             dana_to_sp: Arc::new(RwLock::new(HashMap::new())),
             network: SpNetwork::Testnet,
-            nonce_store: Arc::new(RwLock::new(HashMap::new())),
+            nonce_store: Arc::new(RwLock::new(NonceStore::default())),
             register_create_lock: Arc::new(tokio::sync::Mutex::new(())),
         })
     }
 
     async fn seed_nonce(state: &AppState, nonce: &str, user_name: &str, sp_str: &str, domain: &str) {
-        state.nonce_store.write().await.insert(
+        state.nonce_store.write().await.put(
             nonce.to_string(),
             NonceEntry {
                 user_name: user_name.to_string(),
                 sp_address: sp_str.to_string(),
                 domain: domain.to_string(),
+                issued_to_ip: "127.0.0.1".parse().unwrap(),
                 expires_at: Instant::now() + Duration::from_secs(300),
             },
         );
@@ -2009,7 +2230,7 @@ async fn test_nonce_claim_rejects_mismatch_and_expired() {
         let addr = listener.local_addr().expect("flood server addr");
         let serve_state = state.clone();
         let serve = tokio::spawn(async move {
-            axum::serve(listener, build_router(serve_state))
+            axum::serve(listener, build_router(serve_state).into_make_service_with_connect_info::<SocketAddr>())
                 .await
                 .expect("test server");
         });
@@ -2029,7 +2250,7 @@ async fn test_nonce_claim_rejects_mismatch_and_expired() {
             sp_to_dana: Arc::new(RwLock::new(HashMap::new())),
             dana_to_sp: Arc::new(RwLock::new(HashMap::new())),
             network: SpNetwork::Testnet,
-            nonce_store: Arc::new(RwLock::new(HashMap::new())),
+            nonce_store: Arc::new(RwLock::new(NonceStore::default())),
             register_create_lock: Arc::new(tokio::sync::Mutex::new(())),
         })
     }
