@@ -1559,4 +1559,279 @@ async fn test_nonce_claim_rejects_mismatch_and_expired() {
     let expired = super::claim_nonce(&store, "n2", "alice", "sp1alice", "test.com").await;
     assert!(expired.is_err());
 }
+
+    // ───────────────────────────────────────────────────────────────────────
+    // HIGH-availability regression for finding t_466ace42: the register-create
+    // critical section must fail CLOSED on a stalled upstream instead of
+    // pinning every registration until a process restart.
+    //
+    // RED at base a6147ff: no outbound deadline exists anywhere on the
+    // register path, so the stalled stub request below hangs forever while
+    // holding the global register-create mutex ⇒ the 60/90s bound asserts fire.
+    // GREEN with the REGISTER_*_TIMEOUT_SECS deadlines + their fail-closed arms.
+    //
+    // API-neutral by design: the tests only touch items that exist at base
+    // (handle_register, AppState, the CLOUDFLARE_API_BASE_URL stub hook), so
+    // the same text compiles red at base and green on the fix commit.
+    // ───────────────────────────────────────────────────────────────────────
+
+    /// std::net stub of the Cloudflare TXT-create endpoint (deliberately avoids
+    /// async/tokio features + wiremock so a stalled request cannot share any
+    /// client/pool state with the answered one). A POST whose JSON body
+    /// mentions the trigger word "stale-me" in its JSON body is read and then NEVER
+    /// answered (connection held open)
+    /// — the stalled round-trip from the finding. Any other POST gets an
+    /// instant 200 with a record id.
+    fn spawn_stalling_cloudflare_stub() -> std::net::SocketAddr {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("stub bind");
+        let addr = listener.local_addr().expect("stub addr");
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                std::thread::spawn(move || {
+                    let mut buf: Vec<u8> = Vec::new();
+                    let mut chunk = [0u8; 4096];
+                    loop {
+                        match stream.read(&mut chunk) {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => {
+                                buf.extend(chunk[..n].iter());
+                                if buf.contains(&b'}') {
+                                    break; // whole (small) JSON body arrived
+                                }
+                            }
+                        }
+                    }
+                    let text = String::from_utf8_lossy(&buf);
+                    if text.contains("stale-me") {
+                        // Never answer: the client must hit its own deadline and
+                        // fail that one request closed. Keep the socket open.
+                        std::mem::forget(stream);
+                        return;
+                    }
+                    let body = r#"{"success":true,"result":{"id":"rec-stub-ok"}}"#;
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = stream.write_all(resp.as_bytes());
+                    let _ = stream.flush();
+                });
+            }
+        });
+        addr
+    }
+
+    /// Mint a testnet SP address with a known key and sign the exact server
+    /// challenge message, mirroring handle_register's scheme
+    /// `dana-register:<network key>:<nonce>:<user name>:<server domain>` with
+    /// network key `tsp` for Testnet. Returns (sp address string, sig hex).
+    fn mint_signed_identity(nonce: &str, user_name: &str, domain: &str) -> (String, String) {
+        use secp256k1::{Keypair, Message, Parity, PublicKey, Secp256k1, SecretKey, XOnlyPublicKey};
+        use sha2::{Digest, Sha256};
+        let secp = Secp256k1::new();
+        let sk = SecretKey::new(&mut rand::thread_rng());
+        let kp = Keypair::from_seckey_slice(&secp, sk.as_ref()).expect("keypair");
+        let (x_only, parity) = XOnlyPublicKey::from_keypair(&kp);
+        // secp256k1 0.28 has no PublicKey::from_x_only; rebuild the compressed key
+        // from x bytes + parity and parse it via the stable from_slice path.
+        let mut compressed = [0u8; 33];
+        compressed[0] = match parity { Parity::Even => 2u8, Parity::Odd => 3u8 };
+        compressed[1..].copy_from_slice(&x_only.serialize());
+        let pubkey = PublicKey::from_slice(&compressed).expect("compressed pubkey");
+        // The server verifies the challenge signature against the SP spend key;
+        // scan key == spend key keeps this a parseable BIP-352 shape.
+        let addr = SilentPaymentAddress::new(pubkey, pubkey, SpNetwork::Testnet, 0).expect("sp address");
+        let addr_str = addr.to_string();
+        let message = format!("dana-register:tsp:{}:{}:{}", nonce, user_name, domain);
+        let digest = Sha256::digest(message.as_bytes());
+        let msg = Message::from_digest_slice(&digest).expect("32-byte digest");
+        let sig = secp.sign_schnorr_with_rng(&msg, &kp, &mut rand::thread_rng());
+        (addr_str, hex::encode(&sig.serialize()[..]))
+    }
+
+    fn stall_test_state() -> Arc<AppState> {
+        // Same real domain the existing DNS-fetch tests use: an unknown user's
+        // TXT lookup answers NXDOMAIN ⇒ Ok(None) fast, so the register path
+        // always reaches the (stubbed) Cloudflare create leg.
+        Arc::new(AppState {
+            zone_id: "zone-1".to_string(),
+            api_token: "tkn-1".to_string(),
+            domain: "danawallet.app".to_string(),
+            sp_to_dana: Arc::new(RwLock::new(HashMap::new())),
+            dana_to_sp: Arc::new(RwLock::new(HashMap::new())),
+            network: SpNetwork::Testnet,
+            nonce_store: Arc::new(RwLock::new(HashMap::new())),
+            register_create_lock: Arc::new(tokio::sync::Mutex::new(())),
+        })
+    }
+
+    async fn seed_nonce(state: &AppState, nonce: &str, user_name: &str, sp_str: &str, domain: &str) {
+        state.nonce_store.write().await.insert(
+            nonce.to_string(),
+            NonceEntry {
+                user_name: user_name.to_string(),
+                sp_address: sp_str.to_string(),
+                domain: domain.to_string(),
+                expires_at: Instant::now() + Duration::from_secs(300),
+            },
+        );
+    }
+
+    /// One full signed /register drive; the user name must NOT contain the
+    /// stub's stall trigger word unless the request is meant to stall.
+    async fn drive_register(state: &Arc<AppState>, user_name: &str, nonce: &str) -> (StatusCode, RegisterResponse) {
+        let domain = state.domain.clone();
+        let (sp_str, sig_hex) = mint_signed_identity(nonce, user_name, &domain);
+        seed_nonce(state, nonce, user_name, &sp_str, &domain).await;
+        let request = RegisterRequest {
+            id: format!("regression-{}", user_name),
+            domain: domain.clone(),
+            user_name: Some(user_name.to_string()),
+            sp_address: sp_str,
+            signature: sig_hex,
+            nonce: nonce.to_string(),
+        };
+        let (status, AxumJson(body)) = handle_register(State(state.clone()), Json(request)).await;
+        (status, body)
+    }
+
+    #[tokio::test]
+    async fn test_register_stalled_create_fails_closed_and_releases_guard() {
+        let _serial = CF_ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
+        let stub = spawn_stalling_cloudflare_stub();
+        unsafe { std::env::set_var("CLOUDFLARE_API_BASE_URL", format!("http://{}", stub)) };
+        let state = stall_test_state();
+
+        // (a) The stalled Cloudflare create must fail THIS one request closed
+        // (503 from the deadline arm) instead of hanging. RED at base: no client
+        // deadline ⇒ the 60s bound trips (pre-fix panic below).
+        let stalled_res = tokio::time::timeout(
+            Duration::from_secs(60),
+            drive_register(&state, "stale-me-a", "nonce-stale-a"),
+        )
+        .await;
+        // (b) The guard did not leak: a later registration still succeeds.
+        let later_res = tokio::time::timeout(
+            Duration::from_secs(60),
+            drive_register(&state, "later-b", "nonce-later-b"),
+        )
+        .await;
+
+        unsafe { std::env::remove_var("CLOUDFLARE_API_BASE_URL") };
+        std::mem::drop(_serial);
+
+        let stalled = match stalled_res {
+            Err(_elapsed) => panic!(
+                "stalled /register hung past the 60s bound — the create round-trip must fail closed on its own deadline (pre-fix RED state)"
+            ),
+            Ok(res) => res,
+        };
+        let later = match later_res {
+            Err(_elapsed) => panic!(
+                "a registration stayed blocked after the stalled request — its guard/slot leaked when the deadline tripped (pre-fix RED state)"
+            ),
+            Ok(res) => res,
+        };
+        assert_eq!(stalled.0, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            stalled.1.message.to_lowercase().contains("timed out"),
+            "expected a deadline-exceeded failure, got: {}",
+            stalled.1.message
+        );
+        assert_eq!(stalled.1.dns_record_id, None);
+        assert_eq!(later.0, StatusCode::OK);
+        assert_eq!(later.1.dns_record_id.as_deref().map(|s| &s[..]), Some("rec-stub-ok"));
+    }
+
+
+    #[tokio::test]
+    async fn test_register_concurrent_different_names_not_head_of_line_blocked() {
+        let _serial = CF_ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
+        let stub = spawn_stalling_cloudflare_stub();
+        unsafe { std::env::set_var("CLOUDFLARE_API_BASE_URL", format!("http://{}", stub)) };
+        let state = stall_test_state();
+
+        // While request A ("stale-me-b") is pinned on the stalled stub, a
+        // concurrent /register for a DIFFERENT name ("quick-b") must still
+        // complete. RED at base: A holds the global register-create mutex
+        // forever (no deadline anywhere) ⇒ B waits forever ⇒ 90s bound trips.
+        // With the fix, A fails closed at its deadline and B gets its 200.
+        let pair_res = tokio::time::timeout(
+            Duration::from_secs(90),
+            async move {
+                tokio::join!(
+                    drive_register(&state, "stale-me-b", "nonce-hol-b"),
+                    drive_register(&state, "quick-b", "nonce-hol-quick-b")
+                )
+            },
+        )
+        .await;
+
+        unsafe { std::env::remove_var("CLOUDFLARE_API_BASE_URL") };
+        std::mem::drop(_serial);
+
+        let pair = match pair_res {
+            Err(_elapsed) => panic!(
+                "the /register for a different name was head-of-line-blocked behind the stalled one (pre-fix RED state)"
+            ),
+            Ok(pair) => pair,
+        };
+        let (a, b) = pair;
+        assert_eq!(a.0, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(a.1.message.to_lowercase().contains("timed out"), "a: {}", a.1.message);
+        assert_eq!(b.0, StatusCode::OK);
+        assert_eq!(b.1.dns_record_id.as_deref().map(|s| &s[..]), Some("rec-stub-ok"));
+    }
+
+
+    #[tokio::test]
+    async fn test_register_happy_path_through_bounded_client() {
+        let _serial = CF_ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
+        let stub = spawn_stalling_cloudflare_stub();
+        unsafe { std::env::set_var("CLOUDFLARE_API_BASE_URL", format!("http://{}", stub)) };
+        let state = stall_test_state();
+
+        // Acceptance anchor: with real connect+request deadlines on the create
+        // client, a normal registration against a responsive upstream still
+        // succeeds end-to-end and updates both maps. (GREEN at base too; it must
+        // stay green under the fix.)
+        let domain = state.domain.clone();
+        let (sp_str, sig_hex) = mint_signed_identity("nonce-happy", "happy-c", &domain);
+        seed_nonce(&state, "nonce-happy", "happy-c", &sp_str, &domain).await;
+        let request = RegisterRequest {
+            id: "regression-happy".to_string(),
+            domain: domain.clone(),
+            user_name: Some("happy-c".to_string()),
+            sp_address: sp_str.clone(),
+            signature: sig_hex,
+            nonce: "nonce-happy".to_string(),
+        };
+        let drive = handle_register(State(state.clone()), Json(request)).await;
+        unsafe { std::env::remove_var("CLOUDFLARE_API_BASE_URL") };
+        std::mem::drop(_serial);
+
+        let (status, body) = drive;
+        assert_eq!(status, StatusCode::OK, "happy path body: {}", body.0.message);
+        let body = body.0;
+        assert_eq!(body.dns_record_id.as_deref().map(|s| &s[..]), Some("rec-stub-ok"));
+        let dana_addr = format!("happy-c@{}", domain);
+        assert_eq!(body.dana_address.as_deref().map(|s| &s[..]), Some(&dana_addr[..]));
+
+        let sp = SilentPaymentAddress::try_from(sp_str.clone()).expect("parse minted sp address");
+        let sp_map = state.sp_to_dana.read().await;
+        assert!(
+            sp_map.get(&sp).map_or(false, |names| names.iter().any(|n| n == &dana_addr)),
+            "sp_to_dana not updated for {}",
+            dana_addr
+        );
+        drop(sp_map);
+        let dana_map = state.dana_to_sp.read().await;
+        assert!(dana_map.contains_key(&dana_addr), "dana_to_sp not updated");
+        drop(dana_map);
+    }
+
+
 }
