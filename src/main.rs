@@ -36,7 +36,32 @@ fn cloudflare_base_url() -> String {
         .unwrap_or_else(|_| CLOUDFLARE_API_BASE_URL.to_string())
 }
 
+/// Bounded HTTP client for the Cloudflare round-trips made during /register.
+/// Both deadlines are mandatory while the global register-create mutex is
+/// held (per-name locking is absent on this lane): without them a single
+/// stalled API peer head-of-line-blocks every registration until a restart
+/// (HIGH-availability finding t_466ace42).
+fn register_http_client() -> Result<Client, reqwest::Error> {
+    Client::builder()
+        .connect_timeout(Duration::from_secs(REGISTER_CREATE_CONNECT_TIMEOUT_SECS))
+        .timeout(Duration::from_secs(REGISTER_CREATE_TIMEOUT_SECS))
+        .build()
+}
+
 const NONCE_TTL_SECS: u64 = 300; // 5 minutes
+
+/// Hard deadline for the DNS TXT exists-check round-trip during /register: the
+/// proof build over plain DNS-over-TCP to the configured resolver plus the
+/// follow-up HRN resolution. Expiry fails only that one request (503) and
+/// releases the register-create guard — a stalled resolver must no longer
+/// head-of-line-block every registration (HIGH-availability finding t_466ace42).
+const REGISTER_DNS_PROOF_TIMEOUT_SECS: u64 = 12;
+/// Full-request deadline for the Cloudflare TXT create made while the
+/// register-create guard is held; bounds the guard hold time against a
+/// stalled Cloudflare API peer.
+const REGISTER_CREATE_TIMEOUT_SECS: u64 = 15;
+/// TCP/TLS connect deadline for that same Cloudflare client.
+const REGISTER_CREATE_CONNECT_TIMEOUT_SECS: u64 = 5;
 
 struct NonceEntry {
     user_name: String,
@@ -64,6 +89,9 @@ struct AppState {
     nonce_store: Arc<RwLock<HashMap<String, NonceEntry>>>,
     // Serializes DNS exists-check + TXT creation so concurrent registrations
     // cannot both see "absent" and both create a record (MODERATE-5).
+    // Hold time is bounded: every outbound call made under the guard carries a hard
+    // deadline (REGISTER_*_TIMEOUT_SECS below), so a stalled upstream fails that one
+    // request closed instead of stalling registrations until a process restart.
     register_create_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
@@ -651,9 +679,40 @@ async fn handle_register(
 
     let _create_guard = state.register_create_lock.lock().await;
 
-    // First check if the record already exists using DNS-over-HTTPS
-    match fetch_sp_address_from_txt_record(&user_name, &state.domain, sp_address.get_network())
-        .await
+    // First check if the record already exists using DNS-over-HTTPS. The whole
+    // proof-building round-trip carries a hard deadline: on expiry this one request
+    // fails closed with 503, the `_create_guard` taken above drops on the return, and
+    // other registrations keep flowing (no more indefinite head-of-line block).
+    let existing_check = match tokio::time::timeout(
+        Duration::from_secs(REGISTER_DNS_PROOF_TIMEOUT_SECS),
+        fetch_sp_address_from_txt_record(&user_name, &state.domain, sp_address.get_network()),
+    )
+    .await
+    {
+        Err(_elapsed) => {
+            warn!(
+                "DNS TXT verification timed out after {}s for user {}; failing this request closed",
+                REGISTER_DNS_PROOF_TIMEOUT_SECS,
+                user_name
+            );
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                AxumJson(RegisterResponse {
+                    id: request.id,
+                    message: format!(
+                        "DNS verification timed out after {} s, please retry",
+                        REGISTER_DNS_PROOF_TIMEOUT_SECS
+                    ),
+                    dana_address: None,
+                    sp_address: None,
+                    dns_record_id: None,
+                }),
+            );
+        }
+        Ok(result) => result,
+    };
+
+    match existing_check
     {
         Ok(Some(registered_sp_address)) => {
             if registered_sp_address == sp_address {
@@ -720,7 +779,25 @@ async fn handle_register(
     };
 
     info!("Attempting to create TXT record: {}", txt_name);
-    let client = Client::new();
+    // Bounded so this call cannot pin the global register-create guard on a stalled
+    // Cloudflare peer: on expiry the reqwest error trips the deadline arm below and
+    // fails THIS request only (503), dropping the guard with the return.
+    let client = match register_http_client() {
+        Ok(client) => client,
+        Err(e) => {
+            error!("Failed to build the bounded register HTTP client: {}", e);
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                AxumJson(RegisterResponse {
+                    id: request.id,
+                    message: format!("Failed to prepare DNS record creation: {}", e),
+                    dana_address: None,
+                    sp_address: None,
+                    dns_record_id: None,
+                }),
+            );
+        }
+    };
 
     let dns_record_id = match create_txt_record(
         &client,
@@ -775,9 +852,26 @@ async fn handle_register(
             );
         }
         Err(e) => {
-            error!("Error creating TXT record {}: {}", txt_name, e);
+            // Map our deadline trip to 503 for THAT one request; any other create
+            // error keeps the pre-existing 500. Either early return drops _create_guard,
+            // so a stalled upstream can no longer lock in every registration.
+            let create_timed_out = e
+                .downcast_ref::<reqwest::Error>()
+                .map_or(false, |re| re.is_timeout());
+            if create_timed_out {
+                warn!(
+                    "Timed out creating TXT record {} after {}s; failing this request only and releasing the register-create guard",
+                    txt_name, REGISTER_CREATE_TIMEOUT_SECS
+                );
+            } else {
+                error!("Error creating TXT record {}: {}", txt_name, e);
+            }
             return (
-                StatusCode::INTERNAL_SERVER_ERROR,
+                if create_timed_out {
+                    StatusCode::SERVICE_UNAVAILABLE
+                } else {
+                    StatusCode::INTERNAL_SERVER_ERROR
+                },
                 AxumJson(RegisterResponse {
                     id: request.id,
                     message: format!("Failed to create DNS record: {}", e),
