@@ -9,10 +9,10 @@ use axum::{
     routing::{get, post},
 };
 use spdk_wallet::bip321::Bip321Uri;
-use spdk_wallet::client::{parse_sp, parse_tsp, SpUriExtension};
+use spdk_wallet::{parse_sp, parse_tsp, SpUriExtension};
 use log::{debug, error, info, warn};
 use reqwest::Client;
-use silentpayments::{Network as SpNetwork, SilentPaymentCode};
+use spdk_wallet::silentpayments::{Network as SpNetwork, SilentPaymentCode};
 use dnssec_prover::{query::{ProofBuildingError, build_txt_proof_async}, rr::{Name, RR}, ser::parse_rr_stream, validation::verify_rr_stream};
 use std::collections::HashMap;
 use std::{net::SocketAddr, str::FromStr, sync::Arc};
@@ -251,7 +251,7 @@ async fn handle_register(
 
     // Validate SP address
     let sp_address =
-        match silentpayments::SilentPaymentCode::try_from(request.sp_address.clone()) {
+        match SilentPaymentCode::try_from(request.sp_address.clone()) {
             Ok(sp_address) => {
                 debug!("Valid SP address: {}", sp_address);
                 sp_address
@@ -878,7 +878,6 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use silentpayments::SilentPaymentCode;
     use wiremock::{Mock, MockServer, ResponseTemplate};
     use wiremock::matchers::{method, path, header, query_param};
 
@@ -902,7 +901,7 @@ mod tests {
         let result = fetch_sp_address_from_txt_record(
             "matt",
             "mattcorallo.com",
-            silentpayments::Network::Mainnet,
+            SpNetwork::Mainnet,
         )
         .await;
 
@@ -916,7 +915,7 @@ mod tests {
         let result = fetch_sp_address_from_txt_record(
             "unknown",
             "danawallet.app",
-            silentpayments::Network::Mainnet,
+            SpNetwork::Mainnet,
         )
         .await;
 
