@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use silentpayments::Network as SpNetwork;
+use spdk_wallet::silentpayments::Network as SpNetwork;
 
 // Register endpoint types
 #[derive(Deserialize, Serialize)]

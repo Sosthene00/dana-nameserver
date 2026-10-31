@@ -315,7 +315,6 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
- "silentpayments",
  "spdk-wallet",
  "tokio",
  "wiremock",
@@ -1370,14 +1369,13 @@ checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
 
 [[package]]
 name = "silentpayments"
-version = "0.6.0"
-source = "git+https://github.com/cygnet3/spdk?rev=71649ed6647dec8235fd3e8fa5db4f3991db90fc#71649ed6647dec8235fd3e8fa5db4f3991db90fc"
+version = "0.8.1"
+source = "git+https://github.com/cygnet3/spdk?rev=c58d73390d5ac4134f4e3a413a92cb7ce8d05027#c58d73390d5ac4134f4e3a413a92cb7ce8d05027"
 dependencies = [
  "bech32 0.9.1",
  "bitcoin_hashes 0.13.1",
  "hex",
  "secp256k1",
- "serde",
 ]
 
 [[package]]
@@ -1414,8 +1412,8 @@ dependencies = [
 
 [[package]]
 name = "spdk-core"
-version = "0.1.0"
-source = "git+https://github.com/cygnet3/spdk?rev=71649ed6647dec8235fd3e8fa5db4f3991db90fc#71649ed6647dec8235fd3e8fa5db4f3991db90fc"
+version = "0.0.0"
+source = "git+https://github.com/cygnet3/spdk?rev=c58d73390d5ac4134f4e3a413a92cb7ce8d05027#c58d73390d5ac4134f4e3a413a92cb7ce8d05027"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1427,8 +1425,8 @@ dependencies = [
 
 [[package]]
 name = "spdk-wallet"
-version = "0.1.0"
-source = "git+https://github.com/cygnet3/spdk?rev=71649ed6647dec8235fd3e8fa5db4f3991db90fc#71649ed6647dec8235fd3e8fa5db4f3991db90fc"
+version = "0.0.0"
+source = "git+https://github.com/cygnet3/spdk?rev=c58d73390d5ac4134f4e3a413a92cb7ce8d05027#c58d73390d5ac4134f4e3a413a92cb7ce8d05027"
 dependencies = [
  "anyhow",
  "bdk_coin_select",
