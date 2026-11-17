@@ -1631,6 +1631,7 @@ mod tests {
     use wiremock::matchers::{method, path, header, query_param};
 
     #[tokio::test]
+    #[ignore = "live-internet DNSSEC test: requires external DNS egress and a fully-signing recursive resolver; run with: cargo test --workspace -- --ignored"]
     async fn test_check_txt_record_exists_with_address() {
         let address_to_register = SilentPaymentCode::try_from("sp1qq0cygnetgn3rz2kla5cp05nj5uetlsrzez0l4p8g7wehf7ldr93lcqadw65upymwzvp5ed38l8ur2rznd6934xh95msevwrdwtrpk372hyz4vr6g").unwrap();
         let result = fetch_sp_address_from_txt_record(
@@ -1646,6 +1647,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "live-internet DNSSEC test: requires external DNS egress and a fully-signing recursive resolver; run with: cargo test --workspace -- --ignored"]
     async fn test_check_txt_record_exists_with_no_address() {
         let result = fetch_sp_address_from_txt_record(
             "matt",
@@ -1660,6 +1662,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "live-internet DNSSEC test: requires external DNS egress and a fully-signing recursive resolver; run with: cargo test --workspace -- --ignored"]
     async fn test_check_no_txt_record() {
         let result = fetch_sp_address_from_txt_record(
             "unknown",
@@ -2329,6 +2332,7 @@ mod tests {
     // the already-registered-same-SP path (200 OK, no dns_record_id) instead of a
     // double create. The .expect(1) on the mock is verified on drop by wiremock.
     #[tokio::test]
+    #[ignore = "depends on a live DNS existence check succeeding (needs a DNSSEC-validating resolver with external DNS egress); run with: cargo test --workspace -- --ignored"]
     async fn test_concurrent_register_same_name_single_create() {
         let _guard = CF_ENV_LOCK.lock().unwrap();
         let secp = spdk_wallet::silentpayments::secp256k1::Secp256k1::new();
@@ -2798,6 +2802,7 @@ mod tests {
     }
 
 #[tokio::test]
+    #[ignore = "depends on a live DNS existence check succeeding (needs a DNSSEC-validating resolver with external DNS egress); run with: cargo test --workspace -- --ignored"]
     async fn test_register_wrong_signature_does_not_burn_nonce() {
         let _guard = CF_ENV_LOCK.lock().unwrap();
         let secp = spdk_wallet::silentpayments::secp256k1::Secp256k1::new();
@@ -2870,6 +2875,7 @@ let resp_good = handle_register(
     }
 
     #[tokio::test]
+    #[ignore = "depends on a live DNS existence check succeeding (needs a DNSSEC-validating resolver with external DNS egress); run with: cargo test --workspace -- --ignored"]
     async fn test_register_valid_signature_success() {
         let _guard = CF_ENV_LOCK.lock().unwrap();
         let secp = spdk_wallet::silentpayments::secp256k1::Secp256k1::new();
@@ -2987,6 +2993,7 @@ let resp_good = handle_register(
     }
 
     #[tokio::test]
+    #[ignore = "depends on a live DNS existence check succeeding (needs a DNSSEC-validating resolver with external DNS egress); run with: cargo test --workspace -- --ignored"]
     async fn test_register_new_format_signature_accepted() {
         let _guard = CF_ENV_LOCK.lock().unwrap();
         let secp = spdk_wallet::silentpayments::secp256k1::Secp256k1::new();
