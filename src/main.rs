@@ -136,7 +136,7 @@ impl NonceEntry {
 struct AppState {
     /// Shared secp256k1 context, constructed once at startup and reused by every
     /// Schnorr verification on the request path (no per-request context allocation).
-    secp: silentpayments::secp256k1::Secp256k1<silentpayments::secp256k1::All>,
+    secp: spdk_wallet::silentpayments::secp256k1::Secp256k1<spdk_wallet::silentpayments::secp256k1::All>,
     zone_id: String,
     api_token: String,
     domain: String,
@@ -426,12 +426,12 @@ async fn handle_challenge(
 /// The secp256k1 context is supplied by the caller as a shared, long-lived value
 /// (`AppState::secp`, constructed once at startup) - it is not rebuilt per request.
 fn verify_schnorr_signature(
-    secp: &silentpayments::secp256k1::Secp256k1<silentpayments::secp256k1::All>,
+    secp: &spdk_wallet::silentpayments::secp256k1::Secp256k1<spdk_wallet::silentpayments::secp256k1::All>,
     signature_hex: &str,
     message: &str,
     sp_address: &SilentPaymentCode,
 ) -> Result<(), String> {
-    use silentpayments::secp256k1::{Message, XOnlyPublicKey, schnorr::Signature};
+    use spdk_wallet::silentpayments::secp256k1::{Message, XOnlyPublicKey, schnorr::Signature};
 
     let sig_bytes = hex::decode(signature_hex).map_err(|e| format!("Invalid signature hex: {}", e))?;
     if sig_bytes.len() != 64 {
@@ -1570,7 +1570,7 @@ async fn main() {
     }
 
     let state = Arc::new(AppState {
-        secp: silentpayments::secp256k1::Secp256k1::new(),
+        secp: spdk_wallet::silentpayments::secp256k1::Secp256k1::new(),
         zone_id,
         api_token,
         domain,
@@ -1838,9 +1838,9 @@ mod tests {
     // fork a second nonce/map key over the one TXT name.
     #[tokio::test]
     async fn test_challenge_rejects_non_canonical_name() {
-        let secp = silentpayments::secp256k1::Secp256k1::new();
-        let scan_secret = silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
-        let spend_secret = silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
+        let secp = spdk_wallet::silentpayments::secp256k1::Secp256k1::new();
+        let scan_secret = spdk_wallet::silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
+        let spend_secret = spdk_wallet::silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
         let sp_addr = make_sp_address(&secp, &scan_secret, &spend_secret);
         let domain = "danawallet.app";
         let state = Arc::new(register_state(domain));
@@ -1887,9 +1887,9 @@ mod tests {
     // 401 claim mismatch) and must not burn the nonce.
     #[tokio::test]
     async fn test_register_rejects_non_canonical_name_before_claim() {
-        let secp = silentpayments::secp256k1::Secp256k1::new();
-        let scan_secret = silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
-        let spend_secret = silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
+        let secp = spdk_wallet::silentpayments::secp256k1::Secp256k1::new();
+        let scan_secret = spdk_wallet::silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
+        let spend_secret = spdk_wallet::silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
         let sp_addr = make_sp_address(&secp, &scan_secret, &spend_secret);
         let domain = "danawallet.app";
         let nonce = "nonce-r5-noncanon";
@@ -1950,9 +1950,9 @@ mod tests {
 
     // Helper: build a SilentPaymentAddress from a scan key and a spend key.
     fn make_sp_address(
-        secp: &silentpayments::secp256k1::Secp256k1<silentpayments::secp256k1::All>,
-        scan_secret: &silentpayments::secp256k1::SecretKey,
-        spend_secret: &silentpayments::secp256k1::SecretKey,
+        secp: &spdk_wallet::silentpayments::secp256k1::Secp256k1<spdk_wallet::silentpayments::secp256k1::All>,
+        scan_secret: &spdk_wallet::silentpayments::secp256k1::SecretKey,
+        spend_secret: &spdk_wallet::silentpayments::secp256k1::SecretKey,
     ) -> SilentPaymentCode {
         let scan_pub = scan_secret.public_key(secp);
         let spend_pub = spend_secret.public_key(secp);
@@ -1961,7 +1961,7 @@ mod tests {
 
     #[test]
     fn test_verify_schnorr_signature_valid() {
-        use silentpayments::secp256k1::{Secp256k1, SecretKey};
+        use spdk_wallet::silentpayments::secp256k1::{Secp256k1, SecretKey};
         use rand::thread_rng;
 
         let secp = Secp256k1::new();
@@ -1978,7 +1978,7 @@ mod tests {
 
     #[test]
     fn test_verify_schnorr_signature_invalid() {
-        use silentpayments::secp256k1::{Secp256k1, SecretKey};
+        use spdk_wallet::silentpayments::secp256k1::{Secp256k1, SecretKey};
         use rand::thread_rng;
 
         let secp = Secp256k1::new();
@@ -2130,9 +2130,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_challenge_id_rotation_same_sp_address_hits_peer_cap() {
-        let secp = silentpayments::secp256k1::Secp256k1::new();
-        let scan_secret = silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
-        let spend_secret = silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
+        let secp = spdk_wallet::silentpayments::secp256k1::Secp256k1::new();
+        let scan_secret = spdk_wallet::silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
+        let spend_secret = spdk_wallet::silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
         let sp_addr = make_sp_address(&secp, &scan_secret, &spend_secret);
         let domain = "danawallet.app";
 
@@ -2173,9 +2173,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_challenge_re_mint_after_claim_and_prune() {
-        let secp = silentpayments::secp256k1::Secp256k1::new();
-        let scan_secret = silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
-        let spend_secret = silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
+        let secp = spdk_wallet::silentpayments::secp256k1::Secp256k1::new();
+        let scan_secret = spdk_wallet::silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
+        let spend_secret = spdk_wallet::silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
         let sp_addr = make_sp_address(&secp, &scan_secret, &spend_secret);
         let domain = "danawallet.app";
         let peer = sp_addr.to_string();
@@ -2231,9 +2231,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_challenge_total_peer_keys_cap_429() {
-        let secp = silentpayments::secp256k1::Secp256k1::new();
-        let scan_secret = silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
-        let spend_secret = silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
+        let secp = spdk_wallet::silentpayments::secp256k1::Secp256k1::new();
+        let scan_secret = spdk_wallet::silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
+        let spend_secret = spdk_wallet::silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
         let sp_addr = make_sp_address(&secp, &scan_secret, &spend_secret);
         let domain = "danawallet.app";
 
@@ -2308,7 +2308,7 @@ mod tests {
     // Helper: build an AppState with the challenge-response plumbing wired up.
     fn register_state(domain: &str) -> AppState {
         AppState {
-            secp: silentpayments::secp256k1::Secp256k1::new(),
+            secp: spdk_wallet::silentpayments::secp256k1::Secp256k1::new(),
             zone_id: "zone-test".to_string(),
             api_token: "token-test".to_string(),
             domain: domain.to_string(),
@@ -2331,9 +2331,9 @@ mod tests {
     #[tokio::test]
     async fn test_concurrent_register_same_name_single_create() {
         let _guard = CF_ENV_LOCK.lock().unwrap();
-        let secp = silentpayments::secp256k1::Secp256k1::new();
-        let scan_secret = silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
-        let spend_secret = silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
+        let secp = spdk_wallet::silentpayments::secp256k1::Secp256k1::new();
+        let scan_secret = spdk_wallet::silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
+        let spend_secret = spdk_wallet::silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
         let sp_addr = make_sp_address(&secp, &scan_secret, &spend_secret);
         let domain = "danawallet.app";
         // Random name so the DNS existence check reports absent on the first pass.
@@ -2439,11 +2439,11 @@ mod tests {
     }
 
     fn sign_with_secret(
-        secp: &silentpayments::secp256k1::Secp256k1<silentpayments::secp256k1::All>,
-        spend_secret: &silentpayments::secp256k1::SecretKey,
+        secp: &spdk_wallet::silentpayments::secp256k1::Secp256k1<spdk_wallet::silentpayments::secp256k1::All>,
+        spend_secret: &spdk_wallet::silentpayments::secp256k1::SecretKey,
         message: &str,
     ) -> String {
-        use silentpayments::secp256k1::{Keypair, Message};
+        use spdk_wallet::silentpayments::secp256k1::{Keypair, Message};
         use sha2::{Digest, Sha256};
         use rand::thread_rng;
 
@@ -2456,8 +2456,8 @@ mod tests {
 
     // Helper: Schnorr-sign the challenge message for a spend secret key.
     fn sign_challenge(
-        secp: &silentpayments::secp256k1::Secp256k1<silentpayments::secp256k1::All>,
-        spend_secret: &silentpayments::secp256k1::SecretKey,
+        secp: &spdk_wallet::silentpayments::secp256k1::Secp256k1<spdk_wallet::silentpayments::secp256k1::All>,
+        spend_secret: &spdk_wallet::silentpayments::secp256k1::SecretKey,
         network_key: &str,
         nonce: &str,
         user_name: &str,
@@ -2469,9 +2469,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_register_missing_signature_rejected() {
-        let secp = silentpayments::secp256k1::Secp256k1::new();
-        let scan_secret = silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
-        let spend_secret = silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
+        let secp = spdk_wallet::silentpayments::secp256k1::Secp256k1::new();
+        let scan_secret = spdk_wallet::silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
+        let spend_secret = spdk_wallet::silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
         let sp_addr = make_sp_address(&secp, &scan_secret, &spend_secret);
         let domain = "danawallet.app";
         let nonce = "nonce-missing-sig";
@@ -2504,9 +2504,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_register_missing_nonce_rejected() {
-        let secp = silentpayments::secp256k1::Secp256k1::new();
-        let scan_secret = silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
-        let spend_secret = silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
+        let secp = spdk_wallet::silentpayments::secp256k1::Secp256k1::new();
+        let scan_secret = spdk_wallet::silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
+        let spend_secret = spdk_wallet::silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
         let sp_addr = make_sp_address(&secp, &scan_secret, &spend_secret);
         let domain = "danawallet.app";
 
@@ -2530,9 +2530,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_register_empty_string_nonce_treated_as_missing() {
-        let secp = silentpayments::secp256k1::Secp256k1::new();
-        let scan_secret = silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
-        let spend_secret = silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
+        let secp = spdk_wallet::silentpayments::secp256k1::Secp256k1::new();
+        let scan_secret = spdk_wallet::silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
+        let spend_secret = spdk_wallet::silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
         let sp_addr = make_sp_address(&secp, &scan_secret, &spend_secret);
         let domain = "danawallet.app";
 
@@ -2561,9 +2561,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_register_whitespace_only_nonce_treated_as_missing() {
-        let secp = silentpayments::secp256k1::Secp256k1::new();
-        let scan_secret = silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
-        let spend_secret = silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
+        let secp = spdk_wallet::silentpayments::secp256k1::Secp256k1::new();
+        let scan_secret = spdk_wallet::silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
+        let spend_secret = spdk_wallet::silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
         let sp_addr = make_sp_address(&secp, &scan_secret, &spend_secret);
         let domain = "danawallet.app";
 
@@ -2592,9 +2592,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_register_empty_string_signature_treated_as_missing() {
-        let secp = silentpayments::secp256k1::Secp256k1::new();
-        let scan_secret = silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
-        let spend_secret = silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
+        let secp = spdk_wallet::silentpayments::secp256k1::Secp256k1::new();
+        let scan_secret = spdk_wallet::silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
+        let spend_secret = spdk_wallet::silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
         let sp_addr = make_sp_address(&secp, &scan_secret, &spend_secret);
         let domain = "danawallet.app";
 
@@ -2626,9 +2626,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_register_whitespace_only_signature_treated_as_missing() {
-        let secp = silentpayments::secp256k1::Secp256k1::new();
-        let scan_secret = silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
-        let spend_secret = silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
+        let secp = spdk_wallet::silentpayments::secp256k1::Secp256k1::new();
+        let scan_secret = spdk_wallet::silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
+        let spend_secret = spdk_wallet::silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
         let sp_addr = make_sp_address(&secp, &scan_secret, &spend_secret);
         let domain = "danawallet.app";
 
@@ -2657,9 +2657,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_register_invalid_signature_rejected() {
-        let secp = silentpayments::secp256k1::Secp256k1::new();
-        let scan_secret = silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
-        let spend_secret = silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
+        let secp = spdk_wallet::silentpayments::secp256k1::Secp256k1::new();
+        let scan_secret = spdk_wallet::silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
+        let spend_secret = spdk_wallet::silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
         let sp_addr = make_sp_address(&secp, &scan_secret, &spend_secret);
         let domain = "danawallet.app";
         let nonce = "nonce-bad-sig";
@@ -2695,9 +2695,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_register_expired_nonce_rejected() {
-        let secp = silentpayments::secp256k1::Secp256k1::new();
-        let scan_secret = silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
-        let spend_secret = silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
+        let secp = spdk_wallet::silentpayments::secp256k1::Secp256k1::new();
+        let scan_secret = spdk_wallet::silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
+        let spend_secret = spdk_wallet::silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
         let sp_addr = make_sp_address(&secp, &scan_secret, &spend_secret);
         let domain = "danawallet.app";
         let nonce = "nonce-expired";
@@ -2733,9 +2733,9 @@ mod tests {
     #[tokio::test]
     async fn test_register_reused_nonce_rejected() {
         let _guard = CF_ENV_LOCK.lock().unwrap();
-        let secp = silentpayments::secp256k1::Secp256k1::new();
-        let scan_secret = silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
-        let spend_secret = silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
+        let secp = spdk_wallet::silentpayments::secp256k1::Secp256k1::new();
+        let scan_secret = spdk_wallet::silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
+        let spend_secret = spdk_wallet::silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
         let sp_addr = make_sp_address(&secp, &scan_secret, &spend_secret);
         let domain = "danawallet.app";
         let nonce = "nonce-reuse";
@@ -2800,9 +2800,9 @@ mod tests {
 #[tokio::test]
     async fn test_register_wrong_signature_does_not_burn_nonce() {
         let _guard = CF_ENV_LOCK.lock().unwrap();
-        let secp = silentpayments::secp256k1::Secp256k1::new();
-        let scan_secret = silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
-        let spend_secret = silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
+        let secp = spdk_wallet::silentpayments::secp256k1::Secp256k1::new();
+        let scan_secret = spdk_wallet::silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
+        let spend_secret = spdk_wallet::silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
         let sp_addr = make_sp_address(&secp, &scan_secret, &spend_secret);
         let domain = "danawallet.app";
         let nonce = "nonce-bad-then-good";
@@ -2872,9 +2872,9 @@ let resp_good = handle_register(
     #[tokio::test]
     async fn test_register_valid_signature_success() {
         let _guard = CF_ENV_LOCK.lock().unwrap();
-        let secp = silentpayments::secp256k1::Secp256k1::new();
-        let scan_secret = silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
-        let spend_secret = silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
+        let secp = spdk_wallet::silentpayments::secp256k1::Secp256k1::new();
+        let scan_secret = spdk_wallet::silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
+        let spend_secret = spdk_wallet::silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
         let sp_addr = make_sp_address(&secp, &scan_secret, &spend_secret);
         let domain = "danawallet.app";
         let nonce = "nonce-good";
@@ -2938,18 +2938,18 @@ let resp_good = handle_register(
     // Helper: sign an arbitrary message with the spend key (for messages the
     // production builder must reject: legacy format / foreign identity fields).
     fn sign_message_raw(
-        spend_secret: &silentpayments::secp256k1::SecretKey,
+        spend_secret: &spdk_wallet::silentpayments::secp256k1::SecretKey,
         message: &str,
     ) -> String {
-        sign_with_secret(&silentpayments::secp256k1::Secp256k1::new(), spend_secret, message)
+        sign_with_secret(&spdk_wallet::silentpayments::secp256k1::Secp256k1::new(), spend_secret, message)
     }
 
     #[tokio::test]
     async fn test_register_old_format_signature_rejected() {
-        let scan_secret = silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
-        let spend_secret = silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
+        let scan_secret = spdk_wallet::silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
+        let spend_secret = spdk_wallet::silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
         let sp_addr = make_sp_address(
-            &silentpayments::secp256k1::Secp256k1::new(),
+            &spdk_wallet::silentpayments::secp256k1::Secp256k1::new(),
             &scan_secret,
             &spend_secret,
         );
@@ -2989,9 +2989,9 @@ let resp_good = handle_register(
     #[tokio::test]
     async fn test_register_new_format_signature_accepted() {
         let _guard = CF_ENV_LOCK.lock().unwrap();
-        let secp = silentpayments::secp256k1::Secp256k1::new();
-        let scan_secret = silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
-        let spend_secret = silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
+        let secp = spdk_wallet::silentpayments::secp256k1::Secp256k1::new();
+        let scan_secret = spdk_wallet::silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
+        let spend_secret = spdk_wallet::silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
         let sp_addr = make_sp_address(&secp, &scan_secret, &spend_secret);
         let domain = "danawallet.app";
         let nonce = "nonce-new-fmt";
@@ -3046,10 +3046,10 @@ let resp_good = handle_register(
 
     #[tokio::test]
     async fn test_register_signature_user_name_mismatch_rejected() {
-        let scan_secret = silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
-        let spend_secret = silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
+        let scan_secret = spdk_wallet::silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
+        let spend_secret = spdk_wallet::silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
         let sp_addr = make_sp_address(
-            &silentpayments::secp256k1::Secp256k1::new(),
+            &spdk_wallet::silentpayments::secp256k1::Secp256k1::new(),
             &scan_secret,
             &spend_secret,
         );
@@ -3092,10 +3092,10 @@ let resp_good = handle_register(
 
     #[tokio::test]
     async fn test_register_signature_domain_mismatch_rejected() {
-        let scan_secret = silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
-        let spend_secret = silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
+        let scan_secret = spdk_wallet::silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
+        let spend_secret = spdk_wallet::silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
         let sp_addr = make_sp_address(
-            &silentpayments::secp256k1::Secp256k1::new(),
+            &spdk_wallet::silentpayments::secp256k1::Secp256k1::new(),
             &scan_secret,
             &spend_secret,
         );
@@ -3157,9 +3157,9 @@ let resp_good = handle_register(
 
     #[tokio::test]
     async fn test_challenge_success_exact_post_r3_message_and_fields() {
-        let secp = silentpayments::secp256k1::Secp256k1::new();
-        let scan_secret = silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
-        let spend_secret = silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
+        let secp = spdk_wallet::silentpayments::secp256k1::Secp256k1::new();
+        let scan_secret = spdk_wallet::silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
+        let spend_secret = spdk_wallet::silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
         let sp_addr = make_sp_address(&secp, &scan_secret, &spend_secret);
         let domain = "danawallet.app";
         let state = Arc::new(register_state(domain));
@@ -3181,11 +3181,11 @@ let resp_good = handle_register(
 
     #[tokio::test]
     async fn test_challenge_reject_branches_400() {
-        let secp = silentpayments::secp256k1::Secp256k1::new();
+        let secp = spdk_wallet::silentpayments::secp256k1::Secp256k1::new();
         let domain = "danawallet.app";
         let state = Arc::new(register_state(domain));
-        let scan_secret = silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
-        let spend_secret = silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
+        let scan_secret = spdk_wallet::silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
+        let spend_secret = spdk_wallet::silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
         let sp_addr = make_sp_address(&secp, &scan_secret, &spend_secret);
 
         // Domain mismatch.
@@ -3205,8 +3205,8 @@ let resp_good = handle_register(
         assert!(resp.1.message.starts_with("Invalid SP address: "));
 
         // Wrong network: a testnet address against this mainnet server.
-        let t_scan = silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
-        let t_spend = silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
+        let t_scan = spdk_wallet::silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
+        let t_spend = spdk_wallet::silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
         let t_addr = SilentPaymentCode::new_v0(
             t_scan.public_key(&secp),
             t_spend.public_key(&secp),
@@ -3221,8 +3221,8 @@ let resp_good = handle_register(
         let mut regtest_state = register_state(domain);
         regtest_state.network = SpNetwork::Regtest;
         let regtest_state = Arc::new(regtest_state);
-        let r_scan = silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
-        let r_spend = silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
+        let r_scan = spdk_wallet::silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
+        let r_spend = spdk_wallet::silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
         let r_addr = SilentPaymentCode::new_v0(
             r_scan.public_key(&secp),
             r_spend.public_key(&secp),
@@ -3239,22 +3239,22 @@ let resp_good = handle_register(
         // no peer approaches max_nonces_per_peer and only the live-store count can
         // trip the guard; the handler reads the cap from the state field, so
         // lowering it keeps the test fast and fully offline.
-        let secp = silentpayments::secp256k1::Secp256k1::new();
+        let secp = spdk_wallet::silentpayments::secp256k1::Secp256k1::new();
         let domain = "danawallet.app";
         let mut state = register_state(domain);
         state.max_pending_nonces = 3;
         let state = Arc::new(state);
 
         for i in 0..3u64 {
-            let scan_secret = silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
-            let spend_secret = silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
+            let scan_secret = spdk_wallet::silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
+            let spend_secret = spdk_wallet::silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
             let sp_addr = make_sp_address(&secp, &scan_secret, &spend_secret);
             let resp = challenge_once(&state, &format!("g-{i}"), domain, "alice", &sp_addr.to_string()).await;
             assert_eq!(resp.0, StatusCode::OK, "mint {i} below the global cap must succeed");
         }
 
-        let scan_secret = silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
-        let spend_secret = silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
+        let scan_secret = spdk_wallet::silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
+        let spend_secret = spdk_wallet::silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
         let sp_addr = make_sp_address(&secp, &scan_secret, &spend_secret);
         let resp = challenge_once(&state, "g-overflow", domain, "alice", &sp_addr.to_string()).await;
         assert_eq!(resp.0, StatusCode::TOO_MANY_REQUESTS);
@@ -3272,9 +3272,9 @@ let resp_good = handle_register(
     // nonce survives the mismatch attempt so its real owner can still register.
     #[tokio::test]
     async fn test_register_nonce_minted_for_alice_rejects_bob() {
-        let secp = silentpayments::secp256k1::Secp256k1::new();
-        let scan_secret = silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
-        let spend_secret = silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
+        let secp = spdk_wallet::silentpayments::secp256k1::Secp256k1::new();
+        let scan_secret = spdk_wallet::silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
+        let spend_secret = spdk_wallet::silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
         let sp_addr = make_sp_address(&secp, &scan_secret, &spend_secret);
         let domain = "danawallet.app";
         let state = Arc::new(register_state(domain));
@@ -3332,9 +3332,9 @@ let resp_good = handle_register(
     async fn test_register_expired_precheck_keeps_slot_releasable_by_janitor() {
         // The read-only pre-check 401 arm must leave the entry store-resident
         // so the janitor's release path can reclaim its mint-time slot.
-        let secp = silentpayments::secp256k1::Secp256k1::new();
-        let scan_secret = silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
-        let spend_secret = silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
+        let secp = spdk_wallet::silentpayments::secp256k1::Secp256k1::new();
+        let scan_secret = spdk_wallet::silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
+        let spend_secret = spdk_wallet::silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
         let sp_addr = make_sp_address(&secp, &scan_secret, &spend_secret);
         let domain = "danawallet.app";
         let user_name = format!("dana-test-user-{}", rand::random::<u64>());
@@ -3397,9 +3397,9 @@ let resp_good = handle_register(
         // a claim ending in Err(EXPIRED) must not leave the mint-time +1
         // stranded with the entry gone from the store — the exact state in
         // which no release path can ever reach it again.
-        let secp = silentpayments::secp256k1::Secp256k1::new();
-        let scan_secret = silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
-        let spend_secret = silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
+        let secp = spdk_wallet::silentpayments::secp256k1::Secp256k1::new();
+        let scan_secret = spdk_wallet::silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
+        let spend_secret = spdk_wallet::silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
         let sp_addr = make_sp_address(&secp, &scan_secret, &spend_secret);
         let domain = "danawallet.app";
         let user_name = format!("dana-test-user-{}", rand::random::<u64>());
@@ -3439,9 +3439,9 @@ let resp_good = handle_register(
         // MAX_NONCES_PER_PEER leaked claim boundaries (the race arm's delegate,
         // claim_nonce's Err path) must not wedge /challenge at 429 for the
         // peer, exactly as an at-cap-but-clean peer keeps minting.
-        let secp = silentpayments::secp256k1::Secp256k1::new();
-        let scan_secret = silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
-        let spend_secret = silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
+        let secp = spdk_wallet::silentpayments::secp256k1::Secp256k1::new();
+        let scan_secret = spdk_wallet::silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
+        let spend_secret = spdk_wallet::silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
         let sp_addr = make_sp_address(&secp, &scan_secret, &spend_secret);
         let domain = "danawallet.app";
         let user_name = format!("dana-test-user-{}", rand::random::<u64>());
