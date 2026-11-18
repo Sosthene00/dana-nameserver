@@ -94,7 +94,7 @@ Agent: **Run `cargo test`** after non-trivial changes and include the result.
 - **API structure:** All endpoints are under `/v1/` prefix. Each request/response includes an `id` field (correlation ID).
 
 ### Route Handlers
-- `GET /v1/info` — Server info (domain, network)
+- `GET /v1/info` — Server info (domain, network, `capabilities`: advertises `"challenge-auth:v1"`)
 - `POST /v1/challenge` — Issue a single-use nonce and the exact challenge message to sign
 - `POST /v1/register` — Register with nonce + Schnorr signature over the /v1/challenge message (call /v1/challenge first)
 - `GET /v1/lookup?sp_address=...` — Lookup Dana address(es) for an SP address
@@ -107,11 +107,12 @@ Registration uses challenge-response authentication to prove ownership of the SP
 1. **Challenge** — `POST /v1/challenge` with `{id, domain, user_name, sp_address}`
    → Server validates inputs, issues a single-use nonce bound to `(user_name, sp_address, domain)` and returns `{id, message, nonce, network_key, expires_at}` (valid for `NONCE_TTL_SECS` = 300 s)
 2. **Sign** — Client signs the returned `message`, built by `challenge_message()` (`src/main.rs`) as
-   `dana-register:{network_key}:{nonce}:{user_name}:{domain}`,
-   with the spend private key corresponding to the SP address (Schnorr signature, message SHA-256 hashed before signing, 64 bytes hex)
+   `dana-register:v1:{network_key}:{nonce}:{user_name}:{domain}:{sp_address}`,
+   with the spend private key corresponding to the SP address (Schnorr signature, message SHA-256 hashed before signing, 64 bytes hex). Spec v1: the message prefix is `dana-register:v1` and the signature binds every mutable field of the record, including the SP address
 3. **Register** — `POST /v1/register` with `{id, domain, user_name, sp_address, nonce, signature}`
    → Server verifies the Schnorr signature FIRST (a failed signature does not burn the nonce, so a corrected retry is allowed until `expires_at`), then claims (consumes) the nonce, then creates the DNS record
 4. **401 semantics** — Missing `nonce`/`signature`, unknown/expired nonce, or a nonce bound to different `user_name`/`sp_address`/`domain` values return `401 Unauthorized`; re-request `/v1/challenge` for a fresh nonce. Over-cap challenge issuance returns `429`.
+5. **Machine-readable error codes (spec v1, section 6)** — every error answer from `/register` carries exactly one spec code in `message`: `nonce_expired`, `nonce_mismatch`, `nonce_unknown`, `signature_invalid` (401), `username_invalid` (400), `username_taken` (409), `rate_limited` (429, per-peer register-attempt cap keyed by the validated SP address, `max_registers_per_peer`), `unknown` (500). Invariants (D2): expiry is checked before the nonce is burned, and a pure signature-verification failure keeps the nonce valid (corrected retries allowed until `expires_at`).
 
 **DNS name constraints**: `user_name` must be an already-canonical RFC 1035 label — `[a-z0-9-]`, 1-63 characters, no leading/trailing/consecutive hyphen; uppercase input is rejected (not folded) on both `/v1/challenge` and `/v1/register`.
 

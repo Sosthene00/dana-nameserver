@@ -89,6 +89,9 @@ pub struct GetInfoResponse {
     pub domain: String,
     #[serde(serialize_with = "serialize_sp_network")]
     pub network: SpNetwork,
+    /// Machine-readable capability strings advertised by this server.
+    /// Spec v1: must contain "challenge-auth:v1".
+    pub capabilities: Vec<String>,
 }
 
 fn serialize_sp_network<S>(net: &SpNetwork, serializer: S) -> Result<S::Ok, S::Error>
@@ -116,7 +119,7 @@ pub struct ChallengeRequest {
 pub struct ChallengeResponse {
     pub id: String,
     /// The exact string the client must sign, as returned by `/challenge`
-    /// (`dana-register:{network_key}:{nonce}:{user_name}:{domain}`).
+    /// (`dana-register:v1:{network_key}:{nonce}:{user_name}:{domain}:{sp_address}`).
     /// Per BIP-340 the client MUST sign SHA-256(message) with the spend secret
     /// key - never the raw message preimage; the server verifies against
     /// `Message::from_digest_slice(Sha256::digest(message))`, so a signature

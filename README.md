@@ -13,10 +13,22 @@ Dana Name Server provides a REST API that allows users to register Bitcoin Silen
 - **Input Validation**: Comprehensive validation for usernames and domains
 - **Duplicate Prevention**: Checks for existing records before creating new ones
 - **RESTful API**: Simple HTTP API for integration
-- **Challenge-Response Authentication**: `/register` requires a single-use nonce from `/v1/challenge` plus a Schnorr signature proving SP address ownership
+- **Challenge-Response Authentication**: `/register` requires a single-use nonce from `/v1/challenge` plus a Schnorr signature proving SP address ownership. The handshake speaks spec v1: the challenge message carries a `dana-register:v1` prefix and binds every mutable field of the record (including the SP address), `/register` answers with machine-readable error codes, and `GET /v1/info` advertises the `challenge-auth:v1` capability
 - **Comprehensive Testing**: Unit tests for all validation functions and DNS operations
 
 ## API Endpoints
+
+### GET `/v1/info`
+
+Returns the served domain, the SP network, and the machine-readable capability list (spec v1):
+
+```json
+{
+    "domain": "example.com",
+    "network": "mainnet",
+    "capabilities": ["challenge-auth:v1"]
+}
+```
 
 ### POST `/v1/challenge`
 
@@ -36,7 +48,7 @@ Issues the single-use nonce used by the challenge-response handshake that authen
 ```json
 {
     "id": "req-1",
-    "message": "dana-register:…",
+    "message": "dana-register:v1:…",
     "nonce": "9f2c…",
     "network_key": "…",
     "expires_at": 0
@@ -44,7 +56,7 @@ Issues the single-use nonce used by the challenge-response handshake that authen
 ```
 
 **Notes:**
-- `message` is the exact string the wallet must sign. It is built by `challenge_message()` in `src/main.rs` — the single source of truth — as: `dana-register:{network_key}:{nonce}:{user_name}:{domain}`
+- `message` is the exact string the wallet must sign. It is built by `challenge_message()` in `src/main.rs` — the single source of truth — as: `dana-register:v1:{network_key}:{nonce}:{user_name}:{domain}:{sp_address}` (spec v1: the signature binds every mutable field of the record, including the SP address being registered)
 - `expires_at` is the Unix timestamp (seconds) at which the nonce expires: issuance time plus `NONCE_TTL_SECS` (300 s = 5 minutes).
 - Nonces are single-use: they are consumed only after `/register` verifies the signature; a failed signature verification does not burn the nonce, so a corrected signature may be retried until `expires_at`.
 - Rate limits: at most `MAX_NONCES_PER_PEER` outstanding nonces per peer, `MAX_PENDING_NONCES` server-wide, and `MAX_TRACKED_PEERS` tracked peers — over-cap requests receive `429 Too Many Requests`.
@@ -53,7 +65,7 @@ Issues the single-use nonce used by the challenge-response handshake that authen
 
 Registers a Bitcoin payment address by creating a DNS TXT record. Registration requires challenge-response authentication: the client must first call `POST /v1/challenge` and then present the returned `nonce` together with a Schnorr `signature` over the exact `message` string:
 
-`dana-register:{network_key}:{nonce}:{user_name}:{domain}`
+`dana-register:v1:{network_key}:{nonce}:{user_name}:{domain}:{sp_address}`
 
 signed with the spend private key that derives `sp_address` (the message is SHA-256 hashed before verification; the signature is 64 bytes, hex-encoded).
 
@@ -69,7 +81,9 @@ signed with the spend private key that derives `sp_address` (the message is SHA-
 }
 ```
 
-`nonce` and `signature` are required: a request without them is rejected with `401 Unauthorized` (`message`: "Missing nonce: call /challenge first to obtain a challenge nonce" or "Missing signature: sign the challenge message with the spend private key"). A `401` is also returned when the nonce is unknown ("Invalid or missing nonce. Please call /challenge first."), expired ("Challenge nonce expired. Please request a new one."), or bound to different `user_name`/`sp_address`/`domain` values ("Nonce does not match this request. Request a new one."). Re-request `/v1/challenge` to obtain a fresh nonce.
+`nonce` and `signature` are required: a request without them is rejected with `401 Unauthorized` (`message`: `nonce_unknown` or `signature_invalid`). A `401` is also returned when the nonce is unknown (`nonce_unknown`), expired (`nonce_expired`), or bound to different `user_name`/`sp_address`/`domain` values (`nonce_mismatch`). Re-request `/v1/challenge` to obtain a fresh nonce.
+
+**Machine-readable error codes (spec v1, section 6):** every error answer from `/register` carries exactly one code in `message`: `nonce_expired`, `nonce_mismatch`, `nonce_unknown`, `signature_invalid` (all `401`), `username_invalid` (`400`, non-canonical label), `username_taken` (`409`, name already registered by a different owner), `rate_limited` (`429`, per-peer register-attempt cap), and `unknown` (`500`, internal/DNS/Cloudflare failures). Expiry is checked before the nonce is burned, and a pure signature-verification failure keeps the nonce valid, so a corrected signature may be retried until `expires_at`.
 
 **Response:**
 ```json
@@ -139,7 +153,7 @@ curl -X POST http://127.0.0.1:8080/v1/challenge \
     "sp_address": "sp1qq0cygnetgn3rz2kla5cp05nj5uetlsrzez0l4p8g7wehf7ldr93lcqadw65upymwzvp5ed38l8ur2rznd6934xh95msevwrdwtrpk372hyz4vr6g"
   }'
 
-# 2) Sign the returned `message` (dana-register:{network_key}:{nonce}:{user_name}:{domain}) with the spend private key,
+# 2) Sign the returned `message` (dana-register:v1:{network_key}:{nonce}:{user_name}:{domain}:{sp_address}) with the spend private key,
 #    then register — nonce and signature are both required (401 without them).
 curl -X POST http://127.0.0.1:8080/v1/register \
   -H "Content-Type: application/json" \

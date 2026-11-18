@@ -27,9 +27,17 @@ use crate::api_structs::{
 };
 
 
-const ERR_NO_CHALLENGE: &str = "Invalid or missing nonce. Please call /challenge first.";
-const ERR_EXPIRED: &str = "Challenge nonce expired. Please request a new one.";
-const ERR_MISMATCH: &str = "Nonce does not match this request. Request a new one.";
+// Spec v1 section 6 machine-readable error codes (D3, D10): every error
+// answer from /register carries exactly one of these codes in the `message`
+// field of RegisterResponse.
+const ERR_NONCE_UNKNOWN: &str = "nonce_unknown";
+const ERR_NONCE_EXPIRED: &str = "nonce_expired";
+const ERR_NONCE_MISMATCH: &str = "nonce_mismatch";
+const ERR_SIGNATURE_INVALID: &str = "signature_invalid";
+const ERR_USERNAME_TAKEN: &str = "username_taken";
+const ERR_USERNAME_INVALID: &str = "username_invalid";
+const ERR_RATE_LIMITED: &str = "rate_limited";
+const ERR_UNKNOWN: &str = "unknown";
 
 /// The per-name lock map behind AppState.name_locks (see `name_lock`).
 type NameLockMap = Mutex<HashMap<String, Arc<NameLockEntry>>>;
@@ -108,6 +116,11 @@ const MAX_TRACKED_PEERS: usize = 1_000;
 // entrant are pruned before inserting a new entrant, so one-shot names cannot
 // grow the map unboundedly.
 const MAX_TRACKED_NAMES: usize = 10_000;
+// v1 spec (D3/D10): per-peer windowed cap on /register attempts, keyed by the
+// validated SP address, so one peer cannot grind the DNS/Cloudflare create
+// path. The window matches the nonce TTL. Tests override the cap via
+// AppState::max_registers_per_peer.
+const MAX_REGISTERS_PER_PEER: u32 = 30;
 
 /// A nonce issued by the challenge endpoint. Bound to the user_name / SP
 /// address / domain at mint time. The entry stays in the store until
@@ -148,11 +161,16 @@ struct AppState {
     nonce_store: Arc<RwLock<HashMap<String, NonceEntry>>>,
     // Per-peer outstanding nonce counts (keyed by the validated SP address string) for rate limiting
     peer_nonce_counts: Arc<RwLock<HashMap<String, u32>>>,
+    // Per-peer /register attempt counters for the v1 `rate_limited` code,
+    // keyed by the validated SP address string: (attempts, window start).
+    register_windows: Arc<RwLock<HashMap<String, (u32, Instant)>>>,
     // Per-name async mutexes serialising the check-then-create critical section of
     // /register, keyed by the canonicalised lowercase DNS label (see name_lock).
     name_locks: Arc<NameLockMap>,
     max_pending_nonces: u64,
     max_nonces_per_peer: u32,
+    // Per-peer cap on /register attempts within the rate-limit window.
+    max_registers_per_peer: u32,
 }
 
 async fn handle_get_info(
@@ -163,6 +181,7 @@ async fn handle_get_info(
         AxumJson(GetInfoResponse {
             domain: state.domain.clone(),
             network: state.network,
+            capabilities: vec!["challenge-auth:v1".to_string()],
         }),
     )
 }
@@ -197,8 +216,9 @@ fn validate_dns_name(name: &str) -> bool {
 
 /// Issue a single-use nonce for the challenge-response handshake and state the
 /// exact message the client is expected to sign: the literal prefix
-/// `dana-register` followed by the colon-separated fields network_key, nonce,
-/// user_name, domain, in that order - `dana-register:{network_key}:{nonce}:{user_name}:{domain}`.
+/// `dana-register:v1` followed by the colon-separated fields network_key, nonce,
+/// user_name, domain, sp_address, in that order -
+/// `dana-register:v1:{network_key}:{nonce}:{user_name}:{domain}:{sp_address}`.
 /// Assemble it with `challenge_message`, the single source of truth, and sign it
 /// with the spend secret key whose public key derives the claimed SP address; the
 /// resulting Schnorr signature is echoed back on the register request to be verified.
@@ -404,7 +424,7 @@ async fn handle_challenge(
         StatusCode::OK,
         AxumJson(ChallengeResponse {
             id: request.id,
-            message: challenge_message(network_key, &nonce, &request.user_name, &request.domain),
+            message: challenge_message(network_key, &nonce, &request.user_name, &request.domain, &sp_address.to_string()),
             nonce,
             network_key: network_key.to_string(),
             expires_at,
@@ -490,13 +510,13 @@ async fn claim_nonce(
     // task can claim or drop the entry between validation and `remove`.
     let claimed = match store.get(nonce) {
         Some(claimed) => claimed.clone(),
-        None => return Err(ERR_NO_CHALLENGE.to_string()),
+        None => return Err(ERR_NONCE_UNKNOWN.to_string()),
     };
     if claimed.is_expired() {
-        return Err(ERR_EXPIRED.to_string());
+        return Err(ERR_NONCE_EXPIRED.to_string());
     }
     if claimed.user_name != user_name || claimed.sp_address != sp_address || claimed.domain != domain {
-        return Err(ERR_MISMATCH.to_string());
+        return Err(ERR_NONCE_MISMATCH.to_string());
     }
     // Validated under the same write guard: only now does the claim consume
     // the nonce. The entry cannot have expired or been re-bound between the
@@ -529,10 +549,20 @@ async fn release_peer_nonce_slot(
 }
 
 /// Single source of truth for the message a client must sign: the literal prefix
-/// `dana-register` followed by the colon-separated fields network_key, nonce,
-/// user_name, domain, in that order.
-    fn challenge_message(network_key: &str, nonce: &str, user_name: &str, domain: &str) -> String {
-        format!("dana-register:{}:{}:{}:{}", network_key, nonce, user_name, domain)
+/// `dana-register:v1` followed by the colon-separated fields network_key, nonce,
+/// user_name, domain, sp_address, in that order (spec v1: the signature binds
+/// every mutable field of the record being registered).
+    fn challenge_message(
+        network_key: &str,
+        nonce: &str,
+        user_name: &str,
+        domain: &str,
+        sp_address: &str,
+    ) -> String {
+        format!(
+            "dana-register:v1:{}:{}:{}:{}:{}",
+            network_key, nonce, user_name, domain, sp_address
+        )
     }
 
 /// Remove expired nonce entries to bound the in-memory store, and decrement /
@@ -795,7 +825,7 @@ async fn handle_register(
         error!("Cloudflare credentials missing, DNS record creation failed");
         return reject(
             StatusCode::INTERNAL_SERVER_ERROR,
-                "Internal server error, please try again later".to_string(),
+                ERR_UNKNOWN.to_string(),
             request.id,
         );
     }
@@ -804,7 +834,7 @@ async fn handle_register(
     if request.domain != state.domain {
         return reject(
             StatusCode::BAD_REQUEST,
-                format!("Server registers for domain: {}", state.domain),
+                ERR_UNKNOWN.to_string(),
             request.id,
         );
     }
@@ -820,7 +850,7 @@ async fn handle_register(
                 warn!("Invalid SP address '{}': {}", request.sp_address, e);
                 return reject(
                     StatusCode::BAD_REQUEST,
-                        format!("Invalid SP address: {}", e),
+                        ERR_UNKNOWN.to_string(),
                     request.id,
                 );
             }
@@ -829,11 +859,7 @@ async fn handle_register(
     if sp_address.network() != state.network {
         return reject(
             StatusCode::BAD_REQUEST,
-                format!(
-                    "Registered address has wrong network type: {:?}, expected: {:?}",
-                    sp_address.network(),
-                    state.network
-                ),
+                ERR_UNKNOWN.to_string(),
             request.id,
         );
     }
@@ -845,11 +871,49 @@ async fn handle_register(
         SpNetwork::Regtest => {
             return reject(
                 StatusCode::BAD_REQUEST,
-                    "Can't register regtest addresses".to_string(),
+                    ERR_UNKNOWN.to_string(),
                 request.id,
             );
         }
     };
+
+    // v1 (D3/D10): per-peer windowed rate limit on register attempts, keyed by
+    // the validated SP address. Checked before any nonce interaction so a
+    // grinding peer is rejected with the spec `rate_limited` code (429) and
+    // cannot burn nonce-store capacity. The window matches the nonce TTL;
+    // counters reset when the window elapses, and stale peers are pruned only
+    // when the map is at capacity (bounded memory, same pattern as the
+    // challenge-side MAX_TRACKED_PEERS cap).
+    {
+        let peer = sp_address.to_string();
+        let mut windows = state.register_windows.write().await;
+        let now = Instant::now();
+        let window = Duration::from_secs(NONCE_TTL_SECS);
+        if !windows.contains_key(&peer) && windows.len() >= MAX_TRACKED_PEERS {
+            windows.retain(|_, (_, start)| now.duration_since(*start) < window);
+            if windows.len() >= MAX_TRACKED_PEERS {
+                warn!("Rejecting register request: tracked peer map at capacity");
+                return reject(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    ERR_RATE_LIMITED.to_string(),
+                    request.id.clone(),
+                );
+            }
+        }
+        let entry = windows.entry(peer).or_insert((0, now));
+        if now.duration_since(entry.1) >= window {
+            *entry = (1, now);
+        } else if entry.0 >= state.max_registers_per_peer {
+            warn!("Register rate limit hit for peer");
+            return reject(
+                StatusCode::TOO_MANY_REQUESTS,
+                ERR_RATE_LIMITED.to_string(),
+                request.id.clone(),
+            );
+        } else {
+            entry.0 += 1;
+        }
+    }
 
     // if user_name is empty, we generate a random one
     let user_name = match request.user_name {
@@ -857,7 +921,7 @@ async fn handle_register(
         None => {
             return reject(
                 StatusCode::BAD_REQUEST,
-                    "User name is required".to_string(),
+                    ERR_USERNAME_INVALID.to_string(),
                 request.id,
             );
         }
@@ -872,7 +936,7 @@ async fn handle_register(
     if !validate_dns_name(&user_name) {
         return reject(
             StatusCode::BAD_REQUEST,
-                "Invalid user name: must be a canonical RFC 1035 label (lowercase ASCII alphanumeric and hyphens, 1-63 chars, no leading/trailing/consecutive hyphen)".to_string(),
+                ERR_USERNAME_INVALID.to_string(),
             request.id,
         );
     }
@@ -880,15 +944,14 @@ async fn handle_register(
     // ── Challenge-response enforcement ──
     // Refuse any DNS mutation unless the client presents a valid nonce issued
     // by /challenge AND a Schnorr signature over the challenge message
-    // (dana-register:{network_key}:{nonce}:{user_name}:{domain}) signed with the spend private
+    // (dana-register:v1:{network_key}:{nonce}:{user_name}:{domain}:{sp_address}) signed with the spend private
     // key that derives the claimed SP address.
     let nonce = match request.nonce {
         Some(nonce) if !nonce.trim().is_empty() => nonce,
         _ => {
             return reject(
                 StatusCode::UNAUTHORIZED,
-                    "Missing nonce: call /challenge first to obtain a challenge nonce"
-                        .to_string(),
+                    ERR_NONCE_UNKNOWN.to_string(),
                 request.id.clone(),
             );
         }
@@ -898,8 +961,7 @@ async fn handle_register(
         _ => {
             return reject(
                 StatusCode::UNAUTHORIZED,
-                    "Missing signature: sign the challenge message with the spend private key"
-                        .to_string(),
+                    ERR_SIGNATURE_INVALID.to_string(),
                 request.id.clone(),
             );
         }
@@ -929,20 +991,20 @@ async fn handle_register(
     let entry = match entry {
         Some(entry) => entry,
         None => {
-            debug!("Nonce claim failed for user {}: {}", user_name, ERR_NO_CHALLENGE);
-            return reject(StatusCode::UNAUTHORIZED, ERR_NO_CHALLENGE.to_string(), request.id.clone());
+            debug!("Nonce claim failed for user {}: {}", user_name, ERR_NONCE_UNKNOWN);
+            return reject(StatusCode::UNAUTHORIZED, ERR_NONCE_UNKNOWN.to_string(), request.id.clone());
         }
     };
     if entry.is_expired() {
-        debug!("Nonce claim failed for user {}: {}", user_name, ERR_EXPIRED);
-        return reject(StatusCode::UNAUTHORIZED, ERR_EXPIRED.to_string(), request.id.clone());
+        debug!("Nonce claim failed for user {}: {}", user_name, ERR_NONCE_EXPIRED);
+        return reject(StatusCode::UNAUTHORIZED, ERR_NONCE_EXPIRED.to_string(), request.id.clone());
     }
     if entry.user_name != user_name
         || entry.sp_address != sp_address.to_string()
         || entry.domain != state.domain
     {
-        debug!("Nonce claim failed for user {}: {}", user_name, ERR_MISMATCH);
-        return reject(StatusCode::UNAUTHORIZED, ERR_MISMATCH.to_string(), request.id.clone());
+        debug!("Nonce claim failed for user {}: {}", user_name, ERR_NONCE_MISMATCH);
+        return reject(StatusCode::UNAUTHORIZED, ERR_NONCE_MISMATCH.to_string(), request.id.clone());
     }
 
     // [4]-[5] Recompute the challenge message (challenge_message is the single source
@@ -953,7 +1015,7 @@ async fn handle_register(
     // until TTL (R7 verify-before-claim).
     // The bindings below come from the looked-up entry and match the request fields
     // checked by the read-only pre-check above; the claim below re-validates them.
-    let message = challenge_message(network_key, &nonce, &entry.user_name, &entry.domain);
+    let message = challenge_message(network_key, &nonce, &entry.user_name, &entry.domain, &entry.sp_address);
     if let Err(e) = verify_schnorr_signature(&state.secp, &signature, &message, &sp_address) {
         warn!(
             "Signature verification failed for user {} on {}: {}",
@@ -961,7 +1023,7 @@ async fn handle_register(
         );
         return reject(
             StatusCode::UNAUTHORIZED,
-                e,
+                ERR_SIGNATURE_INVALID.to_string(),
             request.id.clone(),
         );
     }
@@ -1059,7 +1121,7 @@ async fn handle_register(
             StatusCode::CONFLICT,
             AxumJson(RegisterResponse {
                 id: request.id,
-                message: "TXT record already exists".to_string(),
+                message: ERR_USERNAME_TAKEN.to_string(),
                 dana_address: Some(dana_address),
                 sp_address: Some(existing_sp.to_string()),
                 dns_record_id: None,
@@ -1104,7 +1166,7 @@ async fn handle_register(
                 StatusCode::CONFLICT,
                 AxumJson(RegisterResponse {
                     id: request.id,
-                    message: "TXT record already exists".to_string(),
+                    message: ERR_USERNAME_TAKEN.to_string(),
                     dana_address: Some(format!("{}@{}", user_name, state.domain)),
                     sp_address: Some(sp_address.to_string()),
                     dns_record_id: None, // We don't have the Cloudflare record ID from DNS check
@@ -1123,7 +1185,7 @@ async fn handle_register(
             );
             return reject(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Error checking for existing TXT record: {}", e),
+                    ERR_UNKNOWN.to_string(),
                 request.id,
             );
         }
@@ -1173,8 +1235,7 @@ async fn handle_register(
             );
             return reject(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                    "Failed to create DNS record: No ID returned from Cloudflare"
-                        .to_string(),
+                    ERR_UNKNOWN.to_string(),
                 request.id,
             );
         }
@@ -1182,7 +1243,7 @@ async fn handle_register(
             error!("Error creating TXT record {}: {}", txt_name, e);
             return reject(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Failed to create DNS record: {}", e),
+                    ERR_UNKNOWN.to_string(),
                 request.id,
             );
         }
@@ -1579,9 +1640,11 @@ async fn main() {
         network,
         nonce_store: Arc::new(RwLock::new(HashMap::new())),
         peer_nonce_counts: Arc::new(RwLock::new(HashMap::new())),
+        register_windows: Arc::new(RwLock::new(HashMap::new())),
         name_locks: Arc::new(Mutex::new(HashMap::new())),
         max_pending_nonces: MAX_PENDING_NONCES,
         max_nonces_per_peer: MAX_NONCES_PER_PEER,
+        max_registers_per_peer: MAX_REGISTERS_PER_PEER,
     });
 
     let v1_router = Router::new()
@@ -1909,7 +1972,7 @@ mod tests {
             Instant::now() + Duration::from_secs(60),
         )
         .await;
-        let sig = sign_challenge(&secp, &spend_secret, "sp", nonce, &mixed, domain);
+        let sig = sign_challenge(&secp, &spend_secret, "sp", nonce, &mixed, domain, &sp_str);
 
         let resp = handle_register(
             State(state.clone()),
@@ -1972,11 +2035,11 @@ mod tests {
         let spend_secret = SecretKey::new(&mut thread_rng());
         let sp_addr = make_sp_address(&secp, &scan_secret, &spend_secret);
 
-        let message = "dana-register:sp:deadbeef:alice:example.com";
+        let message = challenge_message("sp", "deadbeef", "alice", "example.com", &sp_addr.to_string());
 
-        let sig_hex = sign_challenge(&secp, &spend_secret, "sp", "deadbeef", "alice", "example.com");
+        let sig_hex = sign_with_secret(&secp, &spend_secret, &message);
 
-        assert!(verify_schnorr_signature(&secp, &sig_hex, message, &sp_addr).is_ok());
+        assert!(verify_schnorr_signature(&secp, &sig_hex, &message, &sp_addr).is_ok());
     }
 
     #[test]
@@ -1989,17 +2052,17 @@ mod tests {
         let spend_secret = SecretKey::new(&mut thread_rng());
         let sp_addr = make_sp_address(&secp, &scan_secret, &spend_secret);
 
-        let message = "dana-register:sp:deadbeef:alice:example.com";
+        let message = challenge_message("sp", "deadbeef", "alice", "example.com", &sp_addr.to_string());
 
         // Sign with a different key than the spend key embedded in sp_addr
         let other_secret = SecretKey::new(&mut thread_rng());
 
-        let sig_hex = sign_challenge(&secp, &other_secret, "sp", "deadbeef", "alice", "example.com");
+        let sig_hex = sign_with_secret(&secp, &other_secret, &message);
 
-        assert!(verify_schnorr_signature(&secp, &sig_hex, message, &sp_addr).is_err());
+        assert!(verify_schnorr_signature(&secp, &sig_hex, &message, &sp_addr).is_err());
 
         // Also reject a malformed / wrong-length signature
-        assert!(verify_schnorr_signature(&secp, "deadbeef", message, &sp_addr).is_err());
+        assert!(verify_schnorr_signature(&secp, "deadbeef", &message, &sp_addr).is_err());
     }
 
     // ── Challenge-auth (branch 1): nonce claim + expiry ──
@@ -2320,9 +2383,13 @@ mod tests {
             network: SpNetwork::Mainnet,
             nonce_store: Arc::new(RwLock::new(HashMap::new())),
             peer_nonce_counts: Arc::new(RwLock::new(HashMap::new())),
+            register_windows: Arc::new(RwLock::new(HashMap::new())),
             name_locks: Arc::new(Mutex::new(HashMap::new())),
                 max_pending_nonces: 100,
             max_nonces_per_peer: 10,
+            // Tests opt out of the v1 per-peer register rate limit unless a
+            // test explicitly overrides it.
+            max_registers_per_peer: u32::MAX,
         }
     }
 
@@ -2380,8 +2447,8 @@ mod tests {
             domain,
             Instant::now() + Duration::from_secs(60),
         ).await;
-        let sig_a = sign_challenge(&secp, &spend_secret, "sp", nonce_a, &user_name, domain);
-        let sig_b = sign_challenge(&secp, &spend_secret, "sp", nonce_b, &user_name, domain);
+        let sig_a = sign_challenge(&secp, &spend_secret, "sp", nonce_a, &user_name, domain, &sp_str);
+        let sig_b = sign_challenge(&secp, &spend_secret, "sp", nonce_b, &user_name, domain, &sp_str);
 
         let req_a = RegisterRequest {
             id: "req-a".to_string(),
@@ -2466,9 +2533,390 @@ mod tests {
         nonce: &str,
         user_name: &str,
         domain: &str,
+        sp_address: &str,
     ) -> String {
-        let message = challenge_message(network_key, nonce, user_name, domain);
+        let message = challenge_message(network_key, nonce, user_name, domain, sp_address);
         sign_with_secret(secp, spend_secret, &message)
+    }
+
+
+    // ── spec v1 (t_54b86bc0): capability advertisement, v1 challenge format,
+    // machine-readable section-6 error codes, verify-before-burn and
+    // expiry-before-burn ordering ──
+
+    #[tokio::test]
+    async fn test_info_advertises_challenge_auth_v1_capability() {
+        let state = register_state("danawallet.app");
+        let resp = handle_get_info(State(Arc::new(state))).await;
+        assert_eq!(resp.0, StatusCode::OK);
+        assert!(
+            resp.1.capabilities.iter().any(|c| c == "challenge-auth:v1"),
+            "/info must advertise the challenge-auth:v1 capability"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_challenge_message_v1_format_binds_sp_address() {
+        let secp = spdk_wallet::silentpayments::secp256k1::Secp256k1::new();
+        let scan_secret = spdk_wallet::silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
+        let spend_secret = spdk_wallet::silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
+        let sp_addr = make_sp_address(&secp, &scan_secret, &spend_secret);
+        let domain = "danawallet.app";
+        let state = Arc::new(register_state(domain));
+
+        let resp = handle_challenge(
+            State(state.clone()),
+            Json(ChallengeRequest {
+                id: "req-v1".to_string(),
+                domain: domain.to_string(),
+                user_name: "alice".to_string(),
+                sp_address: sp_addr.to_string(),
+            }),
+        )
+        .await;
+
+        assert_eq!(resp.0, StatusCode::OK);
+        // v1 wire contract asserted field-by-field: v1 prefix plus every
+        // mutable field of the record, colon-separated, including the SP
+        // address being registered (D1/D12).
+        let fields: Vec<&str> = resp.1.message.split(':').collect();
+        assert_eq!(fields[0], "dana-register");
+        assert_eq!(fields[1], "v1");
+        assert_eq!(
+            fields.len(),
+            7,
+            "v1 message = dana-register:v1:{{network_key}}:{{nonce}}:{{user_name}}:{{domain}}:{{sp_address}}"
+        );
+        assert_eq!(fields[2], "sp");
+        assert_eq!(fields[3], resp.1.nonce);
+        assert_eq!(fields[4], "alice");
+        assert_eq!(fields[5], domain);
+        assert_eq!(fields[6], sp_addr.to_string());
+        // Identical to what the single source of truth builds.
+        assert_eq!(
+            resp.1.message,
+            challenge_message("sp", &resp.1.nonce, "alice", domain, &sp_addr.to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_register_unknown_nonce_returns_nonce_unknown_code() {
+        let secp = spdk_wallet::silentpayments::secp256k1::Secp256k1::new();
+        let scan_secret = spdk_wallet::silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
+        let spend_secret = spdk_wallet::silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
+        let sp_addr = make_sp_address(&secp, &scan_secret, &spend_secret);
+        let domain = "danawallet.app";
+        let state = register_state(domain);
+
+        let sig = sign_challenge(
+            &secp, &spend_secret, "sp", "no-such-nonce", "alice", domain, &sp_addr.to_string(),
+        );
+        let resp = handle_register(
+            State(Arc::new(state)),
+            Json(RegisterRequest {
+                id: "req-unk".to_string(),
+                domain: domain.to_string(),
+                user_name: Some("alice".to_string()),
+                sp_address: sp_addr.to_string(),
+                nonce: Some("no-such-nonce".to_string()),
+                signature: Some(sig),
+            }),
+        )
+        .await;
+
+        assert_eq!(resp.0, StatusCode::UNAUTHORIZED);
+        assert_eq!(resp.1.message, ERR_NONCE_UNKNOWN);
+    }
+
+    #[tokio::test]
+    async fn test_register_expired_nonce_returns_nonce_expired_before_burn() {
+        let secp = spdk_wallet::silentpayments::secp256k1::Secp256k1::new();
+        let scan_secret = spdk_wallet::silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
+        let spend_secret = spdk_wallet::silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
+        let sp_addr = make_sp_address(&secp, &scan_secret, &spend_secret);
+        let domain = "danawallet.app";
+        let nonce = "nonce-expired-v1";
+        let state = register_state(domain);
+
+        make_nonce(
+            &state.nonce_store,
+            nonce,
+            "alice",
+            &sp_addr.to_string(),
+            domain,
+            Instant::now() - Duration::from_secs(1),
+        )
+        .await;
+
+        let sig = sign_challenge(&secp, &spend_secret, "sp", nonce, "alice", domain, &sp_addr.to_string());
+        let resp = handle_register(
+            State(Arc::new(state.clone())),
+            Json(RegisterRequest {
+                id: "req-exp".to_string(),
+                domain: domain.to_string(),
+                user_name: Some("alice".to_string()),
+                sp_address: sp_addr.to_string(),
+                nonce: Some(nonce.to_string()),
+                signature: Some(sig),
+            }),
+        )
+        .await;
+
+        assert_eq!(resp.0, StatusCode::UNAUTHORIZED);
+        assert_eq!(resp.1.message, ERR_NONCE_EXPIRED);
+        // Expiry-before-burn ordering: the expired-nonce rejection must not
+        // consume the entry (only claim after successful verification burns).
+        let store = state.nonce_store.read().await;
+        assert!(
+            store.contains_key(nonce),
+            "an expired-nonce rejection must not burn the nonce entry"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_register_nonce_mismatch_returns_nonce_mismatch_code() {
+        let secp = spdk_wallet::silentpayments::secp256k1::Secp256k1::new();
+        let scan_secret = spdk_wallet::silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
+        let spend_secret = spdk_wallet::silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
+        let sp_addr = make_sp_address(&secp, &scan_secret, &spend_secret);
+        let domain = "danawallet.app";
+        let nonce = "nonce-mismatch-v1";
+        let state = register_state(domain);
+
+        // Nonce bound to a DIFFERENT user_name than the register request.
+        make_nonce(
+            &state.nonce_store,
+            nonce,
+            "mallory",
+            &sp_addr.to_string(),
+            domain,
+            Instant::now() + Duration::from_secs(60),
+        )
+        .await;
+
+        let sig = sign_challenge(&secp, &spend_secret, "sp", nonce, "alice", domain, &sp_addr.to_string());
+        let resp = handle_register(
+            State(Arc::new(state.clone())),
+            Json(RegisterRequest {
+                id: "req-mm".to_string(),
+                domain: domain.to_string(),
+                user_name: Some("alice".to_string()),
+                sp_address: sp_addr.to_string(),
+                nonce: Some(nonce.to_string()),
+                signature: Some(sig),
+            }),
+        )
+        .await;
+
+        assert_eq!(resp.0, StatusCode::UNAUTHORIZED);
+        assert_eq!(resp.1.message, ERR_NONCE_MISMATCH);
+        // The nonce is bound to its challenge request (D12): the mismatched
+        // request must not burn it for the legitimate owner either.
+        let store = state.nonce_store.read().await;
+        assert!(store.contains_key(nonce));
+    }
+
+    #[tokio::test]
+    async fn test_register_invalid_signature_keeps_nonce_valid() {
+        let secp = spdk_wallet::silentpayments::secp256k1::Secp256k1::new();
+        let scan_secret = spdk_wallet::silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
+        let spend_secret = spdk_wallet::silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
+        let sp_addr = make_sp_address(&secp, &scan_secret, &spend_secret);
+        let domain = "danawallet.app";
+        let nonce = "nonce-vb-v1";
+        let state = register_state(domain);
+
+        // Seed the in-memory owner so the corrected-signature retry resolves
+        // hermetically via the same-owner already-registered path (no DNS).
+        {
+            let mut dana_map = state.dana_to_sp.write().await;
+            dana_map.insert(format!("alice@{}", domain), sp_addr.clone());
+        }
+        make_nonce(
+            &state.nonce_store,
+            nonce,
+            "alice",
+            &sp_addr.to_string(),
+            domain,
+            Instant::now() + Duration::from_secs(60),
+        )
+        .await;
+
+        // Signature over a foreign message => pure verification failure.
+        let bad_sig = sign_challenge(&secp, &spend_secret, "sp", "wrong-nonce", "alice", domain, &sp_addr.to_string());
+        let resp1 = handle_register(
+            State(Arc::new(state.clone())),
+            Json(RegisterRequest {
+                id: "req-vb1".to_string(),
+                domain: domain.to_string(),
+                user_name: Some("alice".to_string()),
+                sp_address: sp_addr.to_string(),
+                nonce: Some(nonce.to_string()),
+                signature: Some(bad_sig),
+            }),
+        )
+        .await;
+        assert_eq!(resp1.0, StatusCode::UNAUTHORIZED);
+        assert_eq!(resp1.1.message, ERR_SIGNATURE_INVALID);
+        // Verify-before-burn (D2): the failed verification must leave the
+        // nonce in place and valid.
+        {
+            let store = state.nonce_store.read().await;
+            assert!(store.contains_key(nonce));
+        }
+
+        // Retry with the corrected signature: the nonce was not burned, so
+        // authentication now passes (200 OK via the seeded same-owner path).
+        let good_sig = sign_challenge(&secp, &spend_secret, "sp", nonce, "alice", domain, &sp_addr.to_string());
+        let resp2 = handle_register(
+            State(Arc::new(state)),
+            Json(RegisterRequest {
+                id: "req-vb2".to_string(),
+                domain: domain.to_string(),
+                user_name: Some("alice".to_string()),
+                sp_address: sp_addr.to_string(),
+                nonce: Some(nonce.to_string()),
+                signature: Some(good_sig),
+            }),
+        )
+        .await;
+        assert_ne!(
+            resp2.0,
+            StatusCode::UNAUTHORIZED,
+            "a corrected signature must be accepted: the failed verification kept the nonce valid"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_register_username_taken_code() {
+        let secp = spdk_wallet::silentpayments::secp256k1::Secp256k1::new();
+        let scan_secret = spdk_wallet::silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
+        let spend_secret = spdk_wallet::silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
+        let scan_secret2 = spdk_wallet::silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
+        let spend_secret2 = spdk_wallet::silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
+        let sp_addr = make_sp_address(&secp, &scan_secret, &spend_secret);
+        let other_sp = make_sp_address(&secp, &scan_secret2, &spend_secret2);
+        let domain = "danawallet.app";
+        let nonce = "nonce-taken-v1";
+        let state = register_state(domain);
+
+        // A different owner already claimed the name in-process.
+        {
+            let mut dana_map = state.dana_to_sp.write().await;
+            dana_map.insert(format!("alice@{}", domain), other_sp);
+        }
+        make_nonce(
+            &state.nonce_store,
+            nonce,
+            "alice",
+            &sp_addr.to_string(),
+            domain,
+            Instant::now() + Duration::from_secs(60),
+        )
+        .await;
+
+        let sig = sign_challenge(&secp, &spend_secret, "sp", nonce, "alice", domain, &sp_addr.to_string());
+        let resp = handle_register(
+            State(Arc::new(state)),
+            Json(RegisterRequest {
+                id: "req-taken".to_string(),
+                domain: domain.to_string(),
+                user_name: Some("alice".to_string()),
+                sp_address: sp_addr.to_string(),
+                nonce: Some(nonce.to_string()),
+                signature: Some(sig),
+            }),
+        )
+        .await;
+
+        assert_eq!(resp.0, StatusCode::CONFLICT);
+        assert_eq!(resp.1.message, ERR_USERNAME_TAKEN);
+    }
+
+    #[tokio::test]
+    async fn test_register_invalid_username_returns_username_invalid_code() {
+        let secp = spdk_wallet::silentpayments::secp256k1::Secp256k1::new();
+        let scan_secret = spdk_wallet::silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
+        let spend_secret = spdk_wallet::silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
+        let sp_addr = make_sp_address(&secp, &scan_secret, &spend_secret);
+        let domain = "danawallet.app";
+        let state = register_state(domain);
+
+        // Non-canonical label: rejected before the nonce interaction (R5).
+        let resp = handle_register(
+            State(Arc::new(state)),
+            Json(RegisterRequest {
+                id: "req-invname".to_string(),
+                domain: domain.to_string(),
+                user_name: Some("Alice".to_string()),
+                sp_address: sp_addr.to_string(),
+                nonce: None,
+                signature: None,
+            }),
+        )
+        .await;
+
+        assert_eq!(resp.0, StatusCode::BAD_REQUEST);
+        assert_eq!(resp.1.message, ERR_USERNAME_INVALID);
+    }
+
+    #[tokio::test]
+    async fn test_register_rate_limited_code() {
+        let secp = spdk_wallet::silentpayments::secp256k1::Secp256k1::new();
+        let scan_secret = spdk_wallet::silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
+        let spend_secret = spdk_wallet::silentpayments::secp256k1::SecretKey::new(&mut rand::thread_rng());
+        let sp_addr = make_sp_address(&secp, &scan_secret, &spend_secret);
+        let domain = "danawallet.app";
+        let mut state = register_state(domain);
+        state.max_registers_per_peer = 1;
+
+        for (id, expected) in [
+            ("req-rl1", None),
+            ("req-rl2", Some(StatusCode::TOO_MANY_REQUESTS)),
+        ] {
+            let resp = handle_register(
+                State(Arc::new(state.clone())),
+                Json(RegisterRequest {
+                    id: id.to_string(),
+                    domain: domain.to_string(),
+                    user_name: Some("alice".to_string()),
+                    sp_address: sp_addr.to_string(),
+                    nonce: Some("no-such-nonce".to_string()),
+                    signature: Some("00".repeat(64)),
+                }),
+            )
+            .await;
+            match expected {
+                None => assert_eq!(resp.0, StatusCode::UNAUTHORIZED),
+                Some(code) => {
+                    assert_eq!(resp.0, code);
+                    assert_eq!(resp.1.message, ERR_RATE_LIMITED);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_register_unknown_code_on_internal_failure() {
+        let domain = "danawallet.app";
+        let mut state = register_state(domain);
+        state.zone_id = String::new();
+
+        let resp = handle_register(
+            State(Arc::new(state)),
+            Json(RegisterRequest {
+                id: "req-unknown".to_string(),
+                domain: domain.to_string(),
+                user_name: Some("alice".to_string()),
+                sp_address: "sp1q".to_string() + &"f".repeat(58),
+                nonce: None,
+                signature: None,
+            }),
+        )
+        .await;
+
+        assert_eq!(resp.0, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(resp.1.message, ERR_UNKNOWN);
     }
 
     #[tokio::test]
@@ -2557,7 +3005,7 @@ mod tests {
 
         assert_eq!(resp.0, StatusCode::UNAUTHORIZED);
         assert!(
-            resp.1.0.message.contains("Missing nonce"),
+            resp.1.0.message.contains("nonce_unknown"),
             "empty-string nonce must hit the 401 missing-nonce branch, got {:?}",
             resp.1.0.message
         );
@@ -2588,7 +3036,7 @@ mod tests {
 
         assert_eq!(resp.0, StatusCode::UNAUTHORIZED);
         assert!(
-            resp.1.0.message.contains("Missing nonce"),
+            resp.1.0.message.contains("nonce_unknown"),
             "whitespace-only nonce must hit the 401 missing-nonce branch, got {:?}",
             resp.1.0.message
         );
@@ -2622,7 +3070,7 @@ mod tests {
 
         assert_eq!(resp.0, StatusCode::UNAUTHORIZED);
         assert!(
-            resp.1.0.message.contains("Missing signature"),
+            resp.1.0.message.contains("signature_invalid"),
             "empty-string signature must hit the 401 missing-signature branch, got {:?}",
             resp.1.0.message
         );
@@ -2653,7 +3101,7 @@ mod tests {
 
         assert_eq!(resp.0, StatusCode::UNAUTHORIZED);
         assert!(
-            resp.1.0.message.contains("Missing signature"),
+            resp.1.0.message.contains("signature_invalid"),
             "whitespace-only signature must hit the 401 missing-signature branch, got {:?}",
             resp.1.0.message
         );
@@ -2679,7 +3127,7 @@ mod tests {
         ).await;
 
         // Signature over a *different* nonce/message => verification must fail.
-        let bad_sig = sign_challenge(&secp, &spend_secret, "sp", "wrong-nonce", "alice", domain);
+        let bad_sig = sign_challenge(&secp, &spend_secret, "sp", "wrong-nonce", "alice", domain, &sp_addr.to_string());
 
         let resp = handle_register(
             State(Arc::new(state)),
@@ -2705,7 +3153,7 @@ mod tests {
         let sp_addr = make_sp_address(&secp, &scan_secret, &spend_secret);
         let domain = "danawallet.app";
         let nonce = "nonce-expired";
-        let sig = sign_challenge(&secp, &spend_secret, "sp", nonce, "alice", domain);
+        let sig = sign_challenge(&secp, &spend_secret, "sp", nonce, "alice", domain, &sp_addr.to_string());
 
         let state = register_state(domain);
         // Nonce already expired.
@@ -2743,7 +3191,7 @@ mod tests {
         let sp_addr = make_sp_address(&secp, &scan_secret, &spend_secret);
         let domain = "danawallet.app";
         let nonce = "nonce-reuse";
-        let sig = sign_challenge(&secp, &spend_secret, "sp", nonce, "alice", domain);
+        let sig = sign_challenge(&secp, &spend_secret, "sp", nonce, "alice", domain, &sp_addr.to_string());
 
         let state = register_state(domain);
         make_nonce(
@@ -2814,8 +3262,8 @@ mod tests {
                 // Use a name almost certain to have no DNS record yet, so the DNS
         // existence check returns Ok(None) and registration proceeds.
         let user_name = format!("dana-test-user-{}", rand::random::<u64>());
-        let good_sig = sign_challenge(&secp, &spend_secret, "sp", nonce, &user_name, domain);
-        let bad_sig = sign_challenge(&secp, &spend_secret, "sp-bogus", nonce, &user_name, domain);
+        let good_sig = sign_challenge(&secp, &spend_secret, "sp", nonce, &user_name, domain, &sp_addr.to_string());
+        let bad_sig = sign_challenge(&secp, &spend_secret, "sp-bogus", nonce, &user_name, domain, &sp_addr.to_string());
 
         let m = wiremock::MockServer::start().await;
         Mock::given(method("POST"))
@@ -2887,7 +3335,7 @@ let resp_good = handle_register(
                 // Use a name almost certain to have no DNS record yet, so the DNS
         // existence check returns Ok(None) and registration proceeds.
         let user_name = format!("dana-test-user-{}", rand::random::<u64>());
-        let sig = sign_challenge(&secp, &spend_secret, "sp", nonce, &user_name, domain);
+        let sig = sign_challenge(&secp, &spend_secret, "sp", nonce, &user_name, domain, &sp_addr.to_string());
 
         let m = wiremock::MockServer::start().await;
         Mock::given(method("POST"))
@@ -2936,7 +3384,7 @@ let resp_good = handle_register(
 
     // ── R3: identity fields are covered by the wallet signature ──
     // The signed message is now challenge_message(...) =
-    // dana-register:{network_key}:{nonce}:{user_name}:{domain}. These cases
+    // dana-register:v1:{network_key}:{nonce}:{user_name}:{domain}:{sp_address}. These cases
     // prove the retired pre-R3 format can never be accepted again, and that
     // user_name/domain mismatches are caught by the signature itself, not only
     // by claim_nonce's server-side comparison.
@@ -3007,7 +3455,7 @@ let resp_good = handle_register(
 
         // Happy path under the new bound format: signed over the very values the
         // claimed NonceEntry carries.
-        let sig = sign_challenge(&secp, &spend_secret, "sp", nonce, &user_name, domain);
+        let sig = sign_challenge(&secp, &spend_secret, "sp", nonce, &user_name, domain, &sp_addr.to_string());
 
         let m = wiremock::MockServer::start().await;
         Mock::given(method("POST"))
@@ -3068,7 +3516,7 @@ let resp_good = handle_register(
         // only the signature check can reject this.
         let sig = sign_message_raw(
             &spend_secret,
-            &challenge_message("sp", nonce, "mallory", domain),
+            &challenge_message("sp", nonce, "mallory", domain, &sp_addr.to_string()),
         );
 
         let state = register_state(domain);
@@ -3112,7 +3560,7 @@ let resp_good = handle_register(
         // Same as above with the domain field foreign instead of the user name.
         let sig = sign_message_raw(
             &spend_secret,
-            &challenge_message("sp", nonce, "alice", "example.com"),
+            &challenge_message("sp", nonce, "alice", "example.com", &sp_addr.to_string()),
         );
 
         let state = register_state(domain);
@@ -3182,7 +3630,7 @@ let resp_good = handle_register(
         // from the documented client-side message fails this test loudly.
         assert_eq!(
             resp.1.message,
-            format!("dana-register:sp:{}:alice:danawallet.app", resp.1.nonce)
+            format!("dana-register:v1:sp:{}:alice:danawallet.app:{}", resp.1.nonce, sp_addr.to_string())
         );
     }
 
@@ -3294,7 +3742,7 @@ let resp_good = handle_register(
         // (signed for alice, as the challenge handed out). The mismatch is caught
         // by the read-only pre-check before any verification or claim, so no
         // Cloudflare/DNS access is involved on this path.
-        let sig_for_alice = sign_challenge(&secp, &spend_secret, "sp", &nonce, "alice", domain);
+        let sig_for_alice = sign_challenge(&secp, &spend_secret, "sp", &nonce, "alice", domain, &sp_addr.to_string());
         let resp_bob = handle_register(
             State(state.clone()),
             Json(RegisterRequest {
@@ -3308,7 +3756,7 @@ let resp_good = handle_register(
         )
         .await;
         assert_eq!(resp_bob.0, StatusCode::UNAUTHORIZED);
-        assert_eq!(resp_bob.1.message, ERR_MISMATCH);
+        assert_eq!(resp_bob.1.message, ERR_NONCE_MISMATCH);
 
         // The mismatch attempt must not burn the nonce: the entry is still
         // present for alice and the peer counter is untouched.
@@ -3346,7 +3794,7 @@ let resp_good = handle_register(
         let domain = "danawallet.app";
         let user_name = format!("dana-test-user-{}", rand::random::<u64>());
         let nonce = "nonce-precheck-stale";
-        let sig = sign_challenge(&secp, &spend_secret, "sp", nonce, &user_name, domain);
+        let sig = sign_challenge(&secp, &spend_secret, "sp", nonce, &user_name, domain, &sp_addr.to_string());
 
         let state = register_state(domain);
         // Mint-side accounting exactly as handle_challenge would leave it:
@@ -3379,7 +3827,7 @@ let resp_good = handle_register(
         )
         .await;
         assert_eq!(resp.0, StatusCode::UNAUTHORIZED);
-        assert_eq!(resp.1.message, ERR_EXPIRED);
+        assert_eq!(resp.1.message, ERR_NONCE_EXPIRED);
 
         // Read-only arm: the entry must still be resident for the janitor.
         assert!(
@@ -3428,7 +3876,7 @@ let resp_good = handle_register(
             Ok(_) => panic!("an expired nonce must not be claimable"),
             Err(e) => e,
         };
-        assert_eq!(err, ERR_EXPIRED.to_string());
+        assert_eq!(err, ERR_NONCE_EXPIRED.to_string());
 
         // Whatever the claim arm decided, the pair (entry gone, slot held) is
         // the leak: only store-residency lets the janitor release it later.
@@ -3483,7 +3931,7 @@ let resp_good = handle_register(
                 Ok(_) => panic!("expired nonces must not be claimable"),
                 Err(e) => e,
             };
-            assert_eq!(err, ERR_EXPIRED.to_string());
+            assert_eq!(err, ERR_NONCE_EXPIRED.to_string());
 
             // The janitor pass that runs every 60s in production gets its chance
             // to release the slot each cycle, exactly like the server's task.
