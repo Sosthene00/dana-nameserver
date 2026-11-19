@@ -167,7 +167,24 @@ async fn handle_get_info(
     )
 }
 
-static DNS_RESOLVER_ADDR: SocketAddr = std::net::SocketAddr::V4(std::net::SocketAddrV4::new(std::net::Ipv4Addr::new(1, 1, 1, 1), 53));
+/// Resolver used for outbound DNSSEC proof queries. Defaults to 1.1.1.1:53;
+/// override with the DNS_RESOLVER_ADDR env var (host:port) to point at e.g. a
+/// LAN gateway when external UDP:53 egress is unavailable. Re-read on every
+/// call so tests can retarget it via std::env::set_var.
+fn dns_resolver_addr() -> SocketAddr {
+    const DEFAULT: SocketAddr =
+        std::net::SocketAddr::V4(std::net::SocketAddrV4::new(std::net::Ipv4Addr::new(1, 1, 1, 1), 53));
+    match std::env::var("DNS_RESOLVER_ADDR") {
+        Ok(addr) => match addr.parse() {
+            Ok(parsed) => parsed,
+            Err(e) => {
+                warn!("Invalid DNS_RESOLVER_ADDR '{addr}' ({e}); falling back to 1.1.1.1:53");
+                DEFAULT
+            }
+        },
+        Err(_) => DEFAULT,
+    }
+}
 
 fn has_bitcoin_prefix(data: &[u8]) -> bool {
     data.starts_with(b"bitcoin:")
@@ -619,7 +636,7 @@ async fn fetch_sp_address_from_txt_record(
     let dns_name = Name::try_from(format!("{}.user._bitcoin-payment.{}.", user_name, domain))
         .map_err(|_| anyhow::anyhow!("The provided HRN was too long to fit in a DNS name"))?;
 
-    let proof = match build_txt_proof_async(DNS_RESOLVER_ADDR, &dns_name).await {
+    let proof = match build_txt_proof_async(dns_resolver_addr(), &dns_name).await {
         Ok(proof) => proof,
         Err(e) => {
             let missing = e.get_ref().and_then(|inner| inner.downcast_ref::<ProofBuildingError>())
@@ -1680,6 +1697,36 @@ mod tests {
     // real Cloudflare API key: the base URL is pointed at a wiremock server via
     // the CLOUDFLARE_API_BASE_URL env var. The env var is process-global, so
     // these tests are serialized against each other with CF_ENV_LOCK.
+    // --- DNS resolver env override ---
+    // dns_resolver_addr() re-reads DNS_RESOLVER_ADDR on every call and is
+    // process-global, so serialize against other env-touching tests.
+    static RESOLVER_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn test_dns_resolver_addr_env_override_and_default() {
+        let _guard = RESOLVER_ENV_LOCK.lock().unwrap();
+        let default = std::net::SocketAddr::from(([1, 1, 1, 1], 53));
+
+        // Unset env var: falls back to the built-in default.
+        unsafe { std::env::remove_var("DNS_RESOLVER_ADDR") };
+        assert_eq!(dns_resolver_addr(), default);
+
+        // Valid host:port is honoured (e.g. a LAN gateway in DNS-blocked
+        // sandboxes).
+        unsafe { std::env::set_var("DNS_RESOLVER_ADDR", "192.168.1.1:5353") };
+        assert_eq!(
+            dns_resolver_addr(),
+            std::net::SocketAddr::from(([192, 168, 1, 1], 5353))
+        );
+
+        // Invalid value: warns and falls back to the default instead of
+        // panicking at startup.
+        unsafe { std::env::set_var("DNS_RESOLVER_ADDR", "not-a-socket-addr") };
+        assert_eq!(dns_resolver_addr(), default);
+
+        unsafe { std::env::remove_var("DNS_RESOLVER_ADDR") };
+    }
+
     static CF_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[tokio::test]
